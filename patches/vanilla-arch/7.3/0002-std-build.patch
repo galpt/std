@@ -1,0 +1,35 @@
+From: STD Team <std@kernel.org>
+Date: Sat, 18 Oct 2026 00:00:00 +0000
+Subject: [PATCH 2/4] STD: wire build and sched.h include
+
+Wire std.o behind CONFIG_SMART_TASK_DISTRIBUTOR and include
+std.h from sched.h. Keeps build parallel and avoids a new
+scheduling class.
+
+Signed-off-by: STD Team <std@kernel.org>
+---
+ kernel/sched/Makefile | 1 +
+ kernel/sched/sched.h  | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
+index b1f1a3670..ebc58c930 100644
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
+@@ -40,3 +40,4 @@ obj-y += core.o
+ obj-y += fair.o
+ obj-y += build_policy.o
+ obj-y += build_utility.o
++obj-$(CONFIG_SMART_TASK_DISTRIBUTOR) += std.o
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 4c25fbe84..21266bc32 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -94,6 +94,7 @@ struct cpuidle_state;
+ 
+ #include "cpupri.h"
+ #include "cpudeadline.h"
++#include "std.h"
+ 
+ /* task_struct::on_rq states: */
+ #define TASK_ON_RQ_QUEUED	1

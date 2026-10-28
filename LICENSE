@@ -1,0 +1,11 @@
+SPDX-License-Identifier: GPL-2.0
+
+STD — Smart Task Distributor (reference sources, patches, scripts, docs).
+
+License: GPL-2.0, to match the Linux kernel tree it patches.
+See the kernel COPYING file (GPL version 2) in linux-fresh-7.3/COPYING
+and the SPDX headers in src/std.c and src/std.h.
+
+No additional restrictions are imposed by the STD scripts or docs.
+Installer/uninstaller/cleanup helpers run privileged steps only via
+`sudo -n` (fail-closed) and never auto-upgrade the license.

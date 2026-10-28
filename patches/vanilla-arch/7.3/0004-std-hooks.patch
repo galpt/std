@@ -1,0 +1,30 @@
+From: STD Team <std@kernel.org>
+Date: Sat, 18 Oct 2026 00:00:00 +0000
+Subject: [PATCH 4/4] STD: hook select_task_rq
+
+Hook select_task_rq via std_select_cpu. Keeps routing above deadline
+with no new class. Respects affinity and small-system guard.
+Placement stays at wakeup time; the pick path is untouched so the
+disabled cost is zero.
+
+Signed-off-by: STD Team <std@kernel.org>
+---
+ kernel/sched/core.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3634,6 +3634,13 @@
+ 
+ 	if (p->nr_cpus_allowed > 1 && !is_migration_disabled(p)) {
+ 		cpu = p->sched_class->select_task_rq(p, cpu, *wake_flags);
++		/*
++		 * STD routing shim above deadline: steer toward the
++		 * preferred CPU group while honoring affinity. Stop
++		 * tasks are never intercepted. Placement stays at
++		 * wakeup time; the pick path is untouched.
++		 */
++		cpu = std_select_cpu(p, cpu);
+ 		*wake_flags |= WF_RQ_SELECTED;
+ 	} else {
+ 		cpu = cpumask_any(p->cpus_ptr);

@@ -1,0 +1,28 @@
+# Local kernel tree for build and test persistence. Never committed.
+linux-fresh-7.3/
+
+# Kernel build output.
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+Module.symvers
+modules.order
+System.map
+vmlinux
+
+# Kernel configuration.
+.config
+.config.old
+.config.*
+
+# Patch operation leftovers.
+*.orig
+*.rej
+
+# Temporary build and editor files.
+.tmp_versions/
+*~
+*.swp
+*.bak

@@ -1,0 +1,31 @@
+From: STD Team <std@kernel.org>
+Date: Sat, 18 Oct 2026 00:00:00 +0000
+Subject: [PATCH 1/4] STD: add Kconfig SMART_TASK_DISTRIBUTOR
+
+Add SMART_TASK_DISTRIBUTOR behind kernel/Kconfig.preempt with
+default y. The shim stays above deadline and never adds a new
+scheduling class. Default on keeps single image behavior simple.
+
+Signed-off-by: STD Team <std@kernel.org>
+---
+ kernel/Kconfig.preempt | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/kernel/Kconfig.preempt b/kernel/Kconfig.preempt
+index f294dad43..27ccc4a2a 100644
+--- a/kernel/Kconfig.preempt
++++ b/kernel/Kconfig.preempt
+@@ -197,3 +197,13 @@ config SCHED_CLASS_EXT
+ 	  For more information:
+ 	    Documentation/scheduler/sched-ext.rst
+ 	    https://github.com/sched-ext/scx
++
++config SMART_TASK_DISTRIBUTOR
++	bool "Smart Task Distributor routing shim"
++	default y
++	help
++	  Route tasks above the deadline class without adding a new
++	  scheduling class. Fair tasks prefer housekeeping CPUs and
++	  deadline plus real-time tasks prefer non-housekeeping CPUs.
++	  The shim respects affinity, stays off on small systems and
++	  can be toggled at run time via kernel.std_running.
