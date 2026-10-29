@@ -37,19 +37,21 @@
 #     entry was booted).
 #   sysctl kernel.std_running: expected exact `kernel.std_running = 1`
 #     (anchored `^kernel\.std_running *= *[01]$`; master switch); `1` is
-#     enforcement (default), `0` is off
+#     steering (default), `0` is off
 #     (boot override `std_running=0/1`); missing key means non-STD.
 #   cat std_running: expected `0` or `1`; same cases as sysctl.
 #   cat std_stats: expected dynamic-width bordered approximate table with
-#     `fastpath` / `steered` / `fallback` / `sparse` / `bulk` /
-#     `decaying` / `host_load` in order plus enforcement suffix
-#     `enforced` / `denied` / `starve_bypass` in order (scaled SI-1000),
+#     `fastpath` / `steered` / `fallback` in order (scaled SI-1000),
 #     `+...+` top/middle/bottom borders plus `|` header/value rows (checked:
-#     10 columns in order, >=3 `+` borders, >=2 `|` rows, >=5 lines; `0444`
+#     exact `| fastpath | steered | fallback |` header in order, every `|`
+#     row exactly 3 columns (4 pipes), no sparse/bulk/decaying/host_load/
+#     enforced/denied/starve_bypass (word-boundary), >=3 `+` borders,
+#     >=2 `|` rows, >=5 lines; `0444`
 #     read-only via stat, never chmod; write probe omitted to stay read-only,
 #     `-EROFS` on write is source-documented from proc_std_stats, not
-#     live-probed); anomalous is missing file, empty output, or a table
-#     without `+---+` borders and the 10 columns in order.
+#     live-probed); anomalous is missing file, empty output, a table
+#     without `+---+` borders and the strict 3 columns, or any CAKE-style
+#     10-column table (extra columns / forbidden tokens fail closed).
 #   dmesg negative: expected empty for `grep -E -- 'std_running|std_stats|register_sysctl_sz|procname null|(^|[^A-Za-z0-9_])STD([^A-Za-z0-9_]|$)'`
 #     (STD emits no printk; do NOT use `grep -i std` alone: `zstd`,
 #     `systemd`, `BTRFS` are false positives; portable `(^|[^A-Za-z0-9_])STD`
@@ -61,7 +63,7 @@
 #     the `sudo -n` variant instead of changing permissions.
 #   taskset smoke: expected exit `0` for `taskset -c 0 sleep 0` plus a
 #     printed affinity mask for `taskset -p $$` (1-2 CPU systems pass
-#     through unchanged; enforcement denies only with in-group allowed);
+#     through unchanged; steering denies only with in-group allowed);
 #     anomalous is a non-zero exit or affinity error.
 #   stat initrd: expected size `>=50M` (`52428800` bytes; stock is hundreds
 #     of MB); anomalous is missing image, `0` bytes, or `<50M` (degraded,
@@ -326,7 +328,7 @@ echo "--- sysctl std_running ---"
 if sysctl_out="$(sysctl kernel.std_running 2>&1)"; then
 	echo "  ${sysctl_out}"
 	if printf '%s' "${sysctl_out}" | grep -Eq '^kernel\.std_running *= *1$'; then
-		echo "  OK: master switch 1 (enforcement, default)."
+		echo "  OK: master switch 1 (steering, default)."
 	elif printf '%s' "${sysctl_out}" | grep -Eq '^kernel\.std_running *= *0$'; then
 		echo "  OK: master switch 0 (steering off; boot override std_running=0/1)."
 	else
@@ -341,7 +343,7 @@ echo "--- cat std_running ---"
 if running_val="$(cat /proc/sys/kernel/std_running 2>&1)"; then
 	echo "  /proc/sys/kernel/std_running: ${running_val}"
 	if [ "${running_val}" = "1" ]; then
-		echo "  OK: master switch 1 (enforcement)."
+		echo "  OK: master switch 1 (steering)."
 	elif [ "${running_val}" = "0" ]; then
 		echo "  OK: master switch 0 (steering off)."
 	else
@@ -363,10 +365,18 @@ if stats_out="$(cat /proc/sys/kernel/std_stats 2>&1)"; then
 	case "${border_count}" in ''|*[!0-9]*) border_count=0 ;; esac
 	case "${pipe_count}" in ''|*[!0-9]*) pipe_count=0 ;; esac
 	case "${line_count}" in ''|*[!0-9]*) line_count=0 ;; esac
-	if printf '%s' "${stats_out}" | grep -Eq -- "fastpath.*steered.*fallback.*sparse.*bulk.*decaying.*host_load.*enforced.*denied.*starve_bypass" && [ "${border_count}" -ge 3 ] && [ "${pipe_count}" -ge 2 ] && [ "${line_count}" -ge 5 ]; then
-		echo "  OK: bordered table with fastpath / steered / fallback / sparse / bulk / decaying / host_load / enforced / denied / starve_bypass in order (${border_count} borders, ${pipe_count} piped rows, ${line_count} lines)."
+	header_line="$(printf '%s\n' "${stats_out}" | grep -F -- '|' | grep -E -- 'fastpath.*steered.*fallback' | head -n 1 || true)"
+	header_pipes="$(printf '%s' "${header_line}" | tr -cd '|' | wc -c | tr -d ' ' || true)"
+	case "${header_pipes}" in ''|*[!0-9]*) header_pipes=0 ;; esac
+	# Strict 3-column gate: every '|' row must delimit exactly 3 columns
+	# (4 pipes); any wider CAKE-style row fails. Non-empty means bad width.
+	bad_width="$(printf '%s\n' "${stats_out}" | grep -F -- '|' | awk -F'|' '{print NF-1}' | grep -Ev -- '^4$' || true)"
+	# CAKE extras must be absent (portable word-boundary; \b is GNU-only).
+	forbidden_hits="$(printf '%s' "${stats_out}" | grep -E -- '(^|[^A-Za-z0-9_])(sparse|bulk|decaying|host_load|enforced|denied|starve_bypass)([^A-Za-z0-9_]|$)' || true)"
+	if printf '%s\n' "${header_line}" | grep -Eq -- '^\|[[:space:]]*fastpath[[:space:]]*\|[[:space:]]*steered[[:space:]]*\|[[:space:]]*fallback[[:space:]]*\|[[:space:]]*$' && [ "${header_pipes}" -eq 4 ] && [ -z "${bad_width}" ] && [ -z "${forbidden_hits}" ] && [ "${border_count}" -ge 3 ] && [ "${pipe_count}" -ge 2 ] && [ "${line_count}" -ge 5 ]; then
+		echo "  OK: bordered table with fastpath / steered / fallback in order (${border_count} borders, ${pipe_count} piped rows, ${line_count} lines)."
 	else
-		note_fail "std_stats lacks bordered 10-column table in order (need fastpath/steered/fallback/sparse/bulk/decaying/host_load/enforced/denied/starve_bypass in order, >=3 '+' borders, >=2 '|' rows, >=5 lines; got borders=${border_count} pipes=${pipe_count} lines=${line_count})."
+		note_fail "std_stats lacks strict bordered 3-column table in order (need exact '| fastpath | steered | fallback |' header, every '|' row exactly 3 cols, no sparse/bulk/decaying/host_load/enforced/denied/starve_bypass, >=3 '+' borders, >=2 '|' rows, >=5 lines; got borders=${border_count} pipes=${pipe_count} lines=${line_count})."
 	fi
 	# Read-only mode check (stat only, never chmod): expect 0444 (`stat -c %a` reports 444).
 	# Direct stat first, sudo -n fallback for hardened /proc mounts; unknown is

@@ -10,26 +10,22 @@ empty. Stop never intercepted. Pinned, migrate-disabled and
 core-scheduled (rq-wide, may over-skip) pass through. EXT defers to
 SCX. Guard small systems with fewer than three online CPUs.
 
-Binary std_running: 1 enforcement (default, Cake-style deficit
-sharing), 0 off (near-zero cost). Per-CPU 1024-entry 8-way flow table
-(128 sets, pid/tgid/class hash, LRU) with base_quantum_ns ~1ms,
-per-tin div_shift[8], sparse_thresh and decay_window tunables
-(__read_mostly, no new sysctls). Fast path uses shifts only, no
-alloc/float/do_div.
+Binary std_running: 1 steering (default), 0 off (near-zero cost).
+No per-task state; fast path uses SMT-aware idle selection with
+no alloc/lock/float/do_div.
 
-Enforcement denies cross-group only when in-group allowed exists,
-else falls back; DL/RT imminent tasks bypass and count starve_bypass.
-Per-CPU enforced/denied/starve_bypass counters extend the placement
-counters to a 10-column bordered table with SI-1000 scaled values.
-Rank is SMT-aware for funded flows: fully-idle core first via
+Steering denies cross-group only when in-group allowed exists,
+else falls back. Per-CPU fastpath/steered/fallback counters back
+a 3-column bordered table with SI-1000 scaled values. Rank is
+SMT-aware: fully-idle core first via
 cpu_smt_mask/topology_sibling_cpumask (NULL skipped, singleton
 trivially passes; offline siblings ignored, not a veto), LLC-different
 idle anchored at the class CPU via cpus_share_cache/cpu_llc_shared_mask
 (both ifdef-guarded; on a single-LLC system no LLC-different CPU
 exists, so this tier is a no-op falling through to tier 3), then any
-idle; exhausted flows spread without piling (HK via distribute, non-HK
+idle; spread without piling (HK via distribute, non-HK
 via distribute-like wraparound from a cpumask_any_distribute start, no
-temp mask/alloc). Keeps deficit threshold, housekeeping mask,
+temp mask/alloc). Keeps housekeeping mask,
 cpu_active, available_idle_cpu and nr_cpu_ids fallback; no
 alloc/lock/float/do_div.
 
@@ -43,14 +39,14 @@ documentation.
 Signed-off-by: Galih Tama <galpt@v.recipes>
 ---
  Documentation/admin-guide/kernel-parameters.txt |   4 +
- kernel/sched/std.c                              | 954 ++++++++++++++++++++++++
- kernel/sched/std.h                              |  66 ++
- 3 files changed, 1024 insertions(+)
+ kernel/sched/std.c                              | 591 ++++++++++++++++++++++++
+ kernel/sched/std.h                              |  36 ++
+ 3 files changed, 631 insertions(+)
  create mode 100644 kernel/sched/std.c
  create mode 100644 kernel/sched/std.h
 
 diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
-index e75344f4e..889e8092e 100644
+index e75344f4e..f1d609808 100644
 --- a/Documentation/admin-guide/kernel-parameters.txt
 +++ b/Documentation/admin-guide/kernel-parameters.txt
 @@ -7424,6 +7424,10 @@ Kernel parameters
@@ -59,17 +55,17 @@ index e75344f4e..889e8092e 100644
  
 +	std_running=	[KNL]
 +			Control the Smart Task Distributor routing shim.
-+			Format: 0 (off), 1 (enforcement, default).
++			Format: 0 (off), 1 (steering, default).
 +
  	sti=		[PARISC,HW]
  			Format: <num>
  			Set the STI (builtin display/keyboard on the HP-PARISC
 diff --git a/kernel/sched/std.c b/kernel/sched/std.c
 new file mode 100644
-index 000000000..4517dc6f5
+index 000000000..d98e00a6b
 --- /dev/null
 +++ b/kernel/sched/std.c
-@@ -0,0 +1,954 @@
+@@ -0,0 +1,591 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Smart Task Distributor (STD) routing shim.
@@ -77,7 +73,7 @@ index 000000000..4517dc6f5
 + * Lightweight routing shim above the deadline class with no new
 + * scheduling class. On wakeup it steers fair and idle tasks toward
 + * housekeeping CPUs and deadline plus real-time tasks toward
-+ * non-housekeeping CPUs using Cake-style deficit fairness. Affinity
++ * non-housekeeping CPUs using SMT-aware idle selection. Affinity
 + * is honored via cpumask intersection with fallback to the
 + * class-selected CPU. Stop tasks are never intercepted, extensible
 + * tasks defer to SCX, and the shim stays off on small systems with
@@ -89,7 +85,6 @@ index 000000000..4517dc6f5
 +#include <linux/cpu.h>
 +#include <linux/cpumask_api.h>
 +#include <linux/init.h>
-+#include <linux/jiffies.h>
 +#include <linux/kernel.h>
 +#include <linux/math64.h>
 +#include <linux/percpu.h>
@@ -104,81 +99,25 @@ index 000000000..4517dc6f5
 +/*
 + * Per-CPU routing statistics. Per-CPU counters keep the wakeup path
 + * free of global atomics and allocations; totals are summed on
-+ * readout and are therefore approximate. The first three count
-+ * placement outcomes; sparse counts fair/idle picker-routed wakeups,
-+ * bulk counts deadline/real-time picker-routed wakeups, decaying and
-+ * host_load count every picker-routed wakeup monotonically. Enforced
-+ * counts deficit-funded in-group picks, denied counts cross-group
-+ * picks denied to an in-group CPU and starve_bypass counts DL/RT
-+ * imminent bypasses.
++ * readout and are therefore approximate. Fastpath counts wakeups
++ * already on the preferred CPU, steered counts moved wakeups and
++ * fallback counts wakeups with no usable preferred CPU.
 + */
 +DEFINE_PER_CPU(unsigned long, std_fastpath);
 +DEFINE_PER_CPU(unsigned long, std_steered);
 +DEFINE_PER_CPU(unsigned long, std_fallback);
-+DEFINE_PER_CPU(unsigned long, std_sparse);
-+DEFINE_PER_CPU(unsigned long, std_bulk);
-+DEFINE_PER_CPU(unsigned long, std_decaying);
-+DEFINE_PER_CPU(unsigned long, std_host_load);
-+DEFINE_PER_CPU(unsigned long, std_enforced);
-+DEFINE_PER_CPU(unsigned long, std_denied);
-+DEFINE_PER_CPU(unsigned long, std_starve_bypass);
 +
 +/*
-+ * Cake-style deficit tunables. Hard-coded defaults avoid sysctl bloat;
-+ * all are __read_mostly and read without locking on the fast path.
-+ * base_quantum_ns is ~1ms; sparse_thresh bounds burst credits;
-+ * decay_window is in jiffies; div_shift scales quantum per tin with
-+ * shifts only.
-+ */
-+static unsigned long std_base_quantum_ns __read_mostly = 1000000UL;
-+static unsigned int std_sparse_thresh __read_mostly = 8;
-+static unsigned long std_decay_window __read_mostly = 32;
-+static unsigned int std_div_shift[STD_TIN_MAX] __read_mostly = {
-+	1, 0, 0, 0, 0, 0, 2, 3
-+};
-+
-+/*
-+ * Per-flow deficit entry. 32 bytes so the per-CPU shard of
-+ * 1024 entries is 32KB. deficit holds (ns >> 10) credits in s64
-+ * capped by STD_HOST_LOAD_MAX, last_exec stores the last observed
-+ * p->se.sum_exec_runtime to charge true execution delta, key mixes
-+ * pid/tgid/class, lru is a per-CPU clock stamp, last_decay is a
-+ * u32 jiffies stamp compared wrap-safe with s32 subtraction, tin
-+ * caches the class. Ordered deficit-first to avoid padding holes.
-+ */
-+struct std_flow {
-+	s64 deficit;
-+	u64 last_exec;
-+	u32 key;
-+	u32 lru;
-+	u32 last_decay;
-+	u8 tin;
-+	u8 valid;
-+	u8 pad[2];
-+};
-+
-+/*
-+ * Per-CPU shard: each CPU owns a private 128-set x 8-way table
-+ * (1024 entries, 32KB with 32-byte flows), so the fast path never
-+ * takes a lock or touches another CPU's state. Chosen over a global
-+ * __read_mostly table plus per-CPU deficits to keep lookup, decay
-+ * and consume lock-free. LRU within a set evicts the oldest stamp
-+ * on miss.
-+ */
-+static DEFINE_PER_CPU(struct std_flow, std_flows[STD_FLOWS]);
-+static DEFINE_PER_CPU(u32, std_flow_clock);
-+
-+/*
-+ * Master switch for the STD shim. Enabled by default so Cake-style
-+ * enforcement is active without reboot. Writes are clamped 0-1 via
-+ * sysctl minmax: 1 enables deficit enforcement, 0 disables steering
++ * Master switch for the STD shim. Enabled by default so steering
++ * is active without reboot. Writes are clamped 0-1 via
++ * sysctl minmax: 1 enables steering, 0 disables steering
 + * (near-zero cost).
 + */
 +int std_running = 1;
 +
 +/*
 + * Boot-time switch: std_running=0 disables the shim, =1 enables
-+ * enforcement. Parsed early via __setup so embedded and server
++ * steering. Parsed early via __setup so embedded and server
 + * images share one binary without rebuilds. Only plain 0 or 1 is
 + * accepted (strict; no <bool> synonyms).
 + */
@@ -239,30 +178,21 @@ index 000000000..4517dc6f5
 +}
 +
 +#ifdef CONFIG_SYSCTL
-+#define STD_NR_STATS	10
++#define STD_NR_STATS	3
 +/*
 + * Read-only report for kernel.std_stats. Sums the per-CPU fastpath,
-+ * steered, fallback, sparse, bulk, decaying, host_load, enforced,
-+ * denied and starve_bypass counters into a dynamic-width bordered
++ * steered and fallback counters into a dynamic-width bordered
 + * table. The sums are approximate because the counters update without
 + * locking. Fastpath counts wakeups already on the preferred CPU,
 + * steered counts moved wakeups and fallback counts wakeups with no
-+ * usable preferred CPU; sparse counts fair/idle picker-routed wakeups,
-+ * bulk counts deadline/real-time picker-routed wakeups, decaying and
-+ * host_load count every picker-routed wakeup monotonically; enforced
-+ * counts deficit-funded in-group picks, denied counts cross-group
-+ * picks denied to an in-group CPU, starve_bypass counts DL/RT
-+ * imminent bypasses. The first seven keep order, names and SI-1000
-+ * scaled formatting; the last three are appended. Values are scaled
-+ * with std_format_scaled for readability (do_div only here).
++ * usable preferred CPU. Values are scaled with std_format_scaled
++ * for readability (do_div only here).
 + */
 +static int proc_std_stats(const struct ctl_table *table, int dir,
 +			  void *buf, size_t *lenp, loff_t *ppos)
 +{
 +	static const char * const headers[] = {
-+		"fastpath", "steered", "fallback", "sparse",
-+		"bulk", "decaying", "host_load", "enforced",
-+		"denied", "starve_bypass"
++		"fastpath", "steered", "fallback"
 +	};
 +	char scaled[STD_NR_STATS][32];
 +	unsigned long sums[STD_NR_STATS] = { 0 };
@@ -282,13 +212,6 @@ index 000000000..4517dc6f5
 +		sums[0] += per_cpu(std_fastpath, cpu);
 +		sums[1] += per_cpu(std_steered, cpu);
 +		sums[2] += per_cpu(std_fallback, cpu);
-+		sums[3] += per_cpu(std_sparse, cpu);
-+		sums[4] += per_cpu(std_bulk, cpu);
-+		sums[5] += per_cpu(std_decaying, cpu);
-+		sums[6] += per_cpu(std_host_load, cpu);
-+		sums[7] += per_cpu(std_enforced, cpu);
-+		sums[8] += per_cpu(std_denied, cpu);
-+		sums[9] += per_cpu(std_starve_bypass, cpu);
 +	}
 +
 +	/* Format all values first, then size columns. */
@@ -398,194 +321,12 @@ index 000000000..4517dc6f5
 +#endif /* CONFIG_SYSCTL */
 +
 +/*
-+ * Map a task to a traffic identifier 0-7. Fair maps to FAIR, idle to
-+ * IDLE (both sparse); deadline/real-time map to DL/RT (bulk) unless
-+ * urgent: DL with less than one quantum of runtime left maps to
-+ * DL_IMMINENT and high-priority RT maps to RT_HIGH for starvation
-+ * bypass. Unknown policies fall back to FAIR. No allocation, float
-+ * or do_div; plain compares only.
-+ */
-+static u8 std_tin_of(struct task_struct *p)
-+{
-+	if (task_has_dl_policy(p)) {
-+		if (p->dl.runtime < (s64)std_base_quantum_ns)
-+			return STD_TIN_DL_IMMINENT;
-+		return STD_TIN_DL;
-+	}
-+	if (task_has_rt_policy(p)) {
-+		if (p->rt_priority >= 50)
-+			return STD_TIN_RT_HIGH;
-+		return STD_TIN_RT;
-+	}
-+	if (idle_policy(p->policy))
-+		return STD_TIN_IDLE;
-+	return STD_TIN_FAIR;
-+}
-+
-+/*
-+ * Hash pid ^ tgid ^ class into 32 bits with xorshift multiply mix.
-+ * Shifts and multiply only; no division, float or allocation. The low
-+ * 7 bits select the set (128 sets); the full hash picks the way.
-+ */
-+static u32 std_flow_hash(struct task_struct *p, u8 tin)
-+{
-+	u32 h;
-+
-+	h = (u32)p->pid ^ ((u32)p->tgid << 8) ^
-+	    ((u32)p->policy << 16) ^ ((u32)tin << 24);
-+	h ^= h >> 16;
-+	h *= 0x9e3779b1U;
-+	h ^= h >> 13;
-+	return h;
-+}
-+
-+/*
-+ * Per-tin quantum helper: (base_quantum_ns >> 10) shifted by
-+ * div_shift[tin]. Caps shift at 20 and floors at 1. Single place
-+ * for the shift/zero guard used by refill and the pick paths.
-+ */
-+static u32 std_flow_quantum(u8 tin)
-+{
-+	u32 q = (u32)(std_base_quantum_ns >> 10);
-+	unsigned int shift = std_div_shift[tin & (STD_TIN_MAX - 1)];
-+
-+	if (shift > 20)
-+		shift = 20;
-+	q >>= shift;
-+	if (q == 0)
-+		q = 1;
-+	return q;
-+}
-+
-+/*
-+ * Look up the caller's flow in the per-CPU shard. On hit refresh the
-+ * LRU stamp and return it; on miss evict the oldest way in the set,
-+ * init key/tin/deficit/last_exec and return it. Lock-free: only this
-+ * CPU's shard is touched. No allocation, float or do_div. The victim
-+ * scan starts at way 0 with oldest at ~0U so way 0 is not starved;
-+ * the clock bumps once per lookup.
-+ */
-+static struct std_flow *std_flow_lookup(struct task_struct *p, u8 tin)
-+{
-+	struct std_flow *table = this_cpu_ptr(std_flows);
-+	u32 hash = std_flow_hash(p, tin);
-+	u32 set = hash & (STD_SETS - 1);
-+	struct std_flow *base = &table[set * STD_WAYS];
-+	u32 key = (u32)p->pid ^ ((u32)p->tgid << 12) ^ ((u32)tin << 20);
-+	u32 now_clock;
-+	int i, victim = 0;
-+	u32 oldest = ~0U;
-+
-+	now_clock = this_cpu_inc_return(std_flow_clock);
-+
-+	for (i = 0; i < STD_WAYS; i++) {
-+		if (base[i].valid && base[i].key == key &&
-+		    base[i].tin == tin) {
-+			base[i].lru = now_clock;
-+			return &base[i];
-+		}
-+	}
-+
-+	for (i = 0; i < STD_WAYS; i++) {
-+		if (!base[i].valid) {
-+			victim = i;
-+			break;
-+		}
-+		if (base[i].lru < oldest) {
-+			oldest = base[i].lru;
-+			victim = i;
-+		}
-+	}
-+
-+	base[victim].key = key;
-+	base[victim].tin = tin;
-+	base[victim].deficit = 0;
-+	base[victim].last_decay = (u32)jiffies;
-+	base[victim].last_exec = READ_ONCE(p->se.sum_exec_runtime);
-+	base[victim].lru = now_clock;
-+	base[victim].valid = 1;
-+	return &base[victim];
-+}
-+
-+/*
-+ * Halve a flow's deficit once per decay_window jiffies. The u32
-+ * stamp is compared wrap-safe with s32 subtraction so the 32-bit
-+ * truncation of jiffies stays correct. Shifts only; no division,
-+ * float, allocation or do_div. Called before refill so idle flows
-+ * regain eligibility without unbounded credit growth.
-+ */
-+static void std_flow_decay(struct std_flow *f, u32 now)
-+{
-+	if ((s32)(now - f->last_decay) >= (s32)std_decay_window) {
-+		f->deficit >>= 1;
-+		f->last_decay = now;
-+	}
-+}
-+
-+/*
-+ * Refill a flow by one per-tin quantum from std_flow_quantum.
-+ * Capped at quantum * sparse_thresh and at STD_HOST_LOAD_MAX to
-+ * bound bursts. Shifts and a bounded multiply only; no division,
-+ * float, allocation or do_div.
-+ */
-+static void std_flow_refill(struct std_flow *f)
-+{
-+	u32 q = std_flow_quantum(f->tin);
-+	unsigned int thresh = std_sparse_thresh;
-+	s64 maxd;
-+
-+	if (thresh == 0)
-+		thresh = 1;
-+	if (thresh > 32)
-+		thresh = 32;
-+	maxd = (s64)q * (s64)thresh;
-+	if (maxd <= 0 || (u64)maxd > STD_HOST_LOAD_MAX)
-+		maxd = (s64)STD_HOST_LOAD_MAX;
-+	if (f->deficit < 0)
-+		f->deficit = 0;
-+	if (f->deficit + (s64)q > maxd)
-+		f->deficit = maxd;
-+	else
-+		f->deficit += (s64)q;
-+}
-+
-+/*
-+ * Charge true execution delta against a flow. Reads
-+ * p->se.sum_exec_runtime once, clamps negative wraps to zero with
-+ * an unsigned compare, scales with >> 10 to match deficit units and
-+ * records the new stamp. The read is safe on wakeup: the task is
-+ * not running so the counter is stable, select_task_rq holds
-+ * pi_lock and 64-bit reads are atomic where it matters; any race
-+ * only ever misstates one quantum. Returns true when funded and
-+ * deducts, false when exhausted. No lock, alloc, float or do_div.
-+ */
-+static bool std_flow_consume(struct task_struct *p, struct std_flow *f)
-+{
-+	u64 now_exec = READ_ONCE(p->se.sum_exec_runtime);
-+	u64 delta;
-+	s64 cost;
-+
-+	if (now_exec >= f->last_exec)
-+		delta = now_exec - f->last_exec;
-+	else
-+		delta = 0;
-+	f->last_exec = now_exec;
-+	cost = (s64)(delta >> 10);
-+	if (f->deficit >= cost) {
-+		f->deficit -= cost;
-+		return true;
-+	}
-+	return false;
-+}
-+
-+/*
-+ * Deficit-weighted rank within the preferred group with SMT-aware tiers:
-+ * well-funded flows (deficit above half the burst cap) scan idle CPUs
-+ * in tiers to preserve locality while avoiding SMT and LLC contention;
-+ * exhausted flows spread to avoid piling on the lowest CPU (HK via
++ * SMT-aware rank within the preferred group: scan idle CPUs in
++ * tiers to preserve locality while avoiding SMT and LLC contention,
++ * then spread to avoid piling on the lowest CPU (HK via
 + * cpumask_any_and_distribute, non-HK via distribute-like wraparound
 + * scan from a cpumask_any_distribute start with no temp mask/alloc).
-+ * Funded tiers: (1) fully-idle core first (all SMT siblings idle)
++ * Tiers: (1) fully-idle core first (all SMT siblings idle)
 + * via cpu_smt_mask (CONFIG_SCHED_SMT) with topology_sibling_cpumask
 + * fallback (NULL is defensively skipped; a singleton mask trivially
 + * passes), (2) LLC-different idle first anchored at the class-selected
@@ -595,138 +336,132 @@ index 000000000..4517dc6f5
 + * to tier 3), (3) any active idle CPU in the group.
 + * Returns nr_cpu_ids when no active allowed CPU exists in the group.
 + * Keeps housekeeping mask, cpu_active, available_idle_cpu and nr_cpu_ids
-+ * fallback; shifts only for the threshold; no alloc, lock, float or
-+ * do_div.
++ * fallback; no alloc, lock, float or do_div.
 + */
-+static unsigned int std_flow_rank(struct std_flow *f,
-+				  const struct cpumask *task,
-+				  const struct cpumask *hk, bool want_hk,
-+				  u32 quantum, int anchor)
++static unsigned int std_rank(const struct cpumask *task,
++			     const struct cpumask *hk, bool want_hk,
++			     int anchor)
 +{
 +	unsigned int cpu, sib;
-+	unsigned int thresh;
 +	bool anchor_valid;
 +
-+	thresh = (quantum * std_sparse_thresh) >> 1;
 +	anchor_valid = anchor >= 0 && (unsigned int)anchor < nr_cpu_ids;
 +
-+	if (f->deficit > (s64)thresh) {
-+		/* Tier 1: fully-idle core first (all siblings idle). */
-+		if (want_hk) {
-+			for_each_cpu_and(cpu, task, hk) {
-+				const struct cpumask *smt;
-+				bool all_idle = true;
++	/* Tier 1: fully-idle core first (all siblings idle). */
++	if (want_hk) {
++		for_each_cpu_and(cpu, task, hk) {
++			const struct cpumask *smt;
++			bool all_idle = true;
 +
-+				if (!cpu_active(cpu) ||
-+				    !available_idle_cpu(cpu))
-+					continue;
++			if (!cpu_active(cpu) ||
++			    !available_idle_cpu(cpu))
++				continue;
 +#ifdef CONFIG_SCHED_SMT
-+				smt = cpu_smt_mask(cpu);
++			smt = cpu_smt_mask(cpu);
 +#else
-+				smt = topology_sibling_cpumask(cpu);
++			smt = topology_sibling_cpumask(cpu);
 +#endif
-+				/* Defensive NULL skip; a singleton mask trivially passes. */
-+				if (!smt)
++			/* Defensive NULL skip; a singleton mask trivially passes. */
++			if (!smt)
++				continue;
++			for_each_cpu(sib, smt) {
++				if (sib == cpu)
 +					continue;
-+				for_each_cpu(sib, smt) {
-+					if (sib == cpu)
-+						continue;
-+					/* Offline siblings never run: ignore, do not veto. */
-+					if (!cpu_active(sib))
-+						continue;
-+					if (!available_idle_cpu(sib)) {
-+						all_idle = false;
-+						break;
-+					}
++				/* Offline siblings never run: ignore, do not veto. */
++				if (!cpu_active(sib))
++					continue;
++				if (!available_idle_cpu(sib)) {
++					all_idle = false;
++					break;
 +				}
-+				if (all_idle)
-+					return cpu;
 +			}
-+		} else {
-+			for_each_cpu_andnot(cpu, task, hk) {
-+				const struct cpumask *smt;
-+				bool all_idle = true;
-+
-+				if (!cpu_active(cpu) ||
-+				    !available_idle_cpu(cpu))
-+					continue;
-+#ifdef CONFIG_SCHED_SMT
-+				smt = cpu_smt_mask(cpu);
-+#else
-+				smt = topology_sibling_cpumask(cpu);
-+#endif
-+				/* Defensive NULL skip; a singleton mask trivially passes. */
-+				if (!smt)
-+					continue;
-+				for_each_cpu(sib, smt) {
-+					if (sib == cpu)
-+						continue;
-+					/* Offline siblings never run: ignore, do not veto. */
-+					if (!cpu_active(sib))
-+						continue;
-+					if (!available_idle_cpu(sib)) {
-+						all_idle = false;
-+						break;
-+					}
-+				}
-+				if (all_idle)
-+					return cpu;
-+			}
++			if (all_idle)
++				return cpu;
 +		}
-+		/* Without CONFIG_SCHED_SMT the tier-1 mask is topology_sibling_cpumask; */
-+		/* on non-SMT builds that mask is a singleton, so tier 1 trivially     */
-+		/* matches every active idle CPU and collapses to the tier-3 scan.     */
++	} else {
++		for_each_cpu_andnot(cpu, task, hk) {
++			const struct cpumask *smt;
++			bool all_idle = true;
++
++			if (!cpu_active(cpu) ||
++			    !available_idle_cpu(cpu))
++				continue;
++#ifdef CONFIG_SCHED_SMT
++			smt = cpu_smt_mask(cpu);
++#else
++			smt = topology_sibling_cpumask(cpu);
++#endif
++			/* Defensive NULL skip; a singleton mask trivially passes. */
++			if (!smt)
++				continue;
++			for_each_cpu(sib, smt) {
++				if (sib == cpu)
++					continue;
++				/* Offline siblings never run: ignore, do not veto. */
++				if (!cpu_active(sib))
++					continue;
++				if (!available_idle_cpu(sib)) {
++					all_idle = false;
++					break;
++				}
++			}
++			if (all_idle)
++				return cpu;
++		}
++	}
++	/* Without CONFIG_SCHED_SMT the tier-1 mask is topology_sibling_cpumask; */
++	/* on non-SMT builds that mask is a singleton, so tier 1 trivially     */
++	/* matches every active idle CPU and collapses to the tier-3 scan.     */
 +#ifdef CONFIG_SMP
-+		/* Tier 2: LLC-different idle first, anchored at the class */
-+		/* CPU to spread cache pressure. Generic test is           */
-+		/* !cpus_share_cache(cpu, anchor). On a single-LLC system  */
-+		/* no LLC-different CPU exists, so this tier is a no-op    */
-+		/* falling through to tier 3.                              */
-+		if (anchor_valid) {
-+			if (want_hk) {
-+				for_each_cpu_and(cpu, task, hk) {
-+					if (!cpu_active(cpu) ||
-+					    !available_idle_cpu(cpu))
-+						continue;
-+#ifdef cpu_llc_shared_mask
-+					if (!cpumask_test_cpu(cpu,
-+							      cpu_llc_shared_mask(anchor)))
-+						return cpu;
-+#else
-+					if (!cpus_share_cache(cpu, anchor))
-+						return cpu;
-+#endif
-+				}
-+			} else {
-+				for_each_cpu_andnot(cpu, task, hk) {
-+					if (!cpu_active(cpu) ||
-+					    !available_idle_cpu(cpu))
-+						continue;
-+#ifdef cpu_llc_shared_mask
-+					if (!cpumask_test_cpu(cpu,
-+							      cpu_llc_shared_mask(anchor)))
-+						return cpu;
-+#else
-+					if (!cpus_share_cache(cpu, anchor))
-+						return cpu;
-+#endif
-+				}
-+			}
-+		}
-+#endif
-+		/* Tier 3: any active idle CPU in the group. */
++	/* Tier 2: LLC-different idle first, anchored at the class */
++	/* CPU to spread cache pressure. Generic test is           */
++	/* !cpus_share_cache(cpu, anchor). On a single-LLC system  */
++	/* no LLC-different CPU exists, so this tier is a no-op    */
++	/* falling through to tier 3.                              */
++	if (anchor_valid) {
 +		if (want_hk) {
 +			for_each_cpu_and(cpu, task, hk) {
-+				if (cpu_active(cpu) &&
-+				    available_idle_cpu(cpu))
++				if (!cpu_active(cpu) ||
++				    !available_idle_cpu(cpu))
++					continue;
++#ifdef cpu_llc_shared_mask
++				if (!cpumask_test_cpu(cpu,
++						      cpu_llc_shared_mask(anchor)))
 +					return cpu;
++#else
++				if (!cpus_share_cache(cpu, anchor))
++					return cpu;
++#endif
 +			}
 +		} else {
 +			for_each_cpu_andnot(cpu, task, hk) {
-+				if (cpu_active(cpu) &&
-+				    available_idle_cpu(cpu))
++				if (!cpu_active(cpu) ||
++				    !available_idle_cpu(cpu))
++					continue;
++#ifdef cpu_llc_shared_mask
++				if (!cpumask_test_cpu(cpu,
++						      cpu_llc_shared_mask(anchor)))
 +					return cpu;
++#else
++				if (!cpus_share_cache(cpu, anchor))
++					return cpu;
++#endif
 +			}
++		}
++	}
++#endif
++	/* Tier 3: any active idle CPU in the group. */
++	if (want_hk) {
++		for_each_cpu_and(cpu, task, hk) {
++			if (cpu_active(cpu) &&
++			    available_idle_cpu(cpu))
++				return cpu;
++		}
++	} else {
++		for_each_cpu_andnot(cpu, task, hk) {
++			if (cpu_active(cpu) &&
++			    available_idle_cpu(cpu))
++				return cpu;
 +		}
 +	}
 +
@@ -740,10 +475,9 @@ index 000000000..4517dc6f5
 +		}
 +	} else {
 +		/*
-+		 * Exhausted non-HK: distribute-like spread without a temp
-+		 * mask or alloc. Seed a rotating start with
-+		 * cpumask_any_distribute, then linear-scan the group with
-+		 * wraparound; cpu_active-gated with nr_cpu_ids fallback.
++		 * Non-HK spread without a temp mask or alloc. Seed a rotating
++		 * start with cpumask_any_distribute, then linear-scan the group
++		 * with wraparound; cpu_active-gated with nr_cpu_ids fallback.
 +		 */
 +		unsigned int start = cpumask_any_distribute(task);
 +
@@ -772,13 +506,10 @@ index 000000000..4517dc6f5
 +}
 +
 +/*
-+ * Pick a housekeeping CPU for fair and idle tasks with deficit
-+ * enforcement. Denies the cross-group CPU only when an active
-+ * in-group allowed CPU exists; otherwise falls back to the original
-+ * CPU. Funded flows consume true execution delta and use
-+ * deficit-weighted ranking; exhausted flows are denied to the first
-+ * active in-group CPU. Fast path stays in-group and never counts
-+ * denied. All outcomes also bump sparse/decaying/host_load.
++ * Pick a housekeeping CPU for fair and idle tasks. Denies the
++ * cross-group CPU only when an active in-group allowed CPU exists;
++ * otherwise falls back to the original CPU. Uses SMT-aware ranking;
++ * fast path stays in-group. No allocation, lock, float or do_div.
 + */
 +static int std_pick_housekeeping(struct task_struct *p, int cpu)
 +{
@@ -786,27 +517,13 @@ index 000000000..4517dc6f5
 +	 * isolcpus and nohz_full intent and reads lock-free here.
 +	 */
 +	const struct cpumask *hk = housekeeping_cpumask(HK_TYPE_DOMAIN);
-+	struct std_flow *f;
-+	u32 now = (u32)jiffies;
-+	u8 tin = std_tin_of(p);
-+	u32 quantum;
 +	unsigned int dest;
 +	unsigned int iter;
 +	bool has_in_group = false;
 +
-+	f = std_flow_lookup(p, tin);
-+	std_flow_decay(f, now);
-+	std_flow_refill(f);
-+	quantum = std_flow_quantum(f->tin);
-+
-+	/* Fast path: already in-group, never denied. */
++	/* Fast path: already in-group. */
 +	if (housekeeping_test_cpu(cpu, HK_TYPE_DOMAIN)) {
-+		if (std_flow_consume(p, f))
-+			this_cpu_inc(std_enforced);
 +		this_cpu_inc(std_fastpath);
-+		this_cpu_inc(std_sparse);
-+		this_cpu_inc(std_decaying);
-+		this_cpu_inc(std_host_load);
 +		return cpu;
 +	}
 +
@@ -818,57 +535,27 @@ index 000000000..4517dc6f5
 +	}
 +	if (!has_in_group) {
 +		this_cpu_inc(std_fallback);
-+		this_cpu_inc(std_sparse);
-+		this_cpu_inc(std_decaying);
-+		this_cpu_inc(std_host_load);
 +		return cpu;
 +	}
 +
-+	if (!std_flow_consume(p, f)) {
-+		dest = std_flow_rank(f, p->cpus_ptr, hk, true, quantum, cpu);
-+		if (dest >= nr_cpu_ids)
-+			dest = cpumask_any_and_distribute(p->cpus_ptr, hk);
-+		if (dest >= nr_cpu_ids || !cpu_active(dest)) {
-+			this_cpu_inc(std_fallback);
-+			this_cpu_inc(std_sparse);
-+			this_cpu_inc(std_decaying);
-+			this_cpu_inc(std_host_load);
-+			return cpu;
-+		}
-+		this_cpu_inc(std_denied);
-+		this_cpu_inc(std_steered);
-+		this_cpu_inc(std_sparse);
-+		this_cpu_inc(std_decaying);
-+		this_cpu_inc(std_host_load);
-+		return dest;
-+	}
-+
-+	dest = std_flow_rank(f, p->cpus_ptr, hk, true, quantum, cpu);
-+	if (dest >= nr_cpu_ids) {
++	dest = std_rank(p->cpus_ptr, hk, true, cpu);
++	if (dest >= nr_cpu_ids || !cpu_active(dest)) {
 +		this_cpu_inc(std_fallback);
-+		this_cpu_inc(std_sparse);
-+		this_cpu_inc(std_decaying);
-+		this_cpu_inc(std_host_load);
 +		return cpu;
 +	}
 +	if ((int)dest == cpu)
 +		this_cpu_inc(std_fastpath);
 +	else
 +		this_cpu_inc(std_steered);
-+	this_cpu_inc(std_enforced);
-+	this_cpu_inc(std_sparse);
-+	this_cpu_inc(std_decaying);
-+	this_cpu_inc(std_host_load);
 +	return dest;
 +}
 +
 +/*
-+ * Pick a non-housekeeping CPU for deadline and real-time tasks with
-+ * deficit enforcement and imminent bypass. DL_IMMINENT and RT_HIGH
-+ * tins bypass the deficit check and keep the class CPU, counting
-+ * starve_bypass to avoid starving urgent wakeups. Otherwise deny
-+ * cross-group only when an active allowed CPU outside housekeeping
-+ * exists; else fallback.
++ * Pick a non-housekeeping CPU for deadline and real-time tasks.
++ * Denies cross-group only when an active allowed CPU outside
++ * housekeeping exists; else fallback. Uses SMT-aware ranking;
++ * fast path stays out-of-group. No allocation, lock, float
++ * or do_div.
 + */
 +static int std_pick_non_housekeeping(struct task_struct *p, int cpu)
 +{
@@ -876,39 +563,13 @@ index 000000000..4517dc6f5
 +	 * isolcpus and nohz_full intent and reads lock-free here.
 +	 */
 +	const struct cpumask *hk = housekeeping_cpumask(HK_TYPE_DOMAIN);
-+	struct std_flow *f;
-+	u32 now = (u32)jiffies;
-+	u8 tin = std_tin_of(p);
-+	u32 quantum;
 +	unsigned int dest;
 +	unsigned int iter;
 +	bool has_out_group = false;
 +
-+	if (tin == STD_TIN_DL_IMMINENT || tin == STD_TIN_RT_HIGH) {
-+		this_cpu_inc(std_starve_bypass);
-+		this_cpu_inc(std_bulk);
-+		this_cpu_inc(std_decaying);
-+		this_cpu_inc(std_host_load);
-+		if (housekeeping_test_cpu(cpu, HK_TYPE_DOMAIN))
-+			this_cpu_inc(std_fallback);
-+		else
-+			this_cpu_inc(std_fastpath);
-+		return cpu;
-+	}
-+
-+	f = std_flow_lookup(p, tin);
-+	std_flow_decay(f, now);
-+	std_flow_refill(f);
-+	quantum = std_flow_quantum(f->tin);
-+
-+	/* Fast path: already outside housekeeping, never denied. */
++	/* Fast path: already outside housekeeping. */
 +	if (!housekeeping_test_cpu(cpu, HK_TYPE_DOMAIN)) {
-+		if (std_flow_consume(p, f))
-+			this_cpu_inc(std_enforced);
 +		this_cpu_inc(std_fastpath);
-+		this_cpu_inc(std_bulk);
-+		this_cpu_inc(std_decaying);
-+		this_cpu_inc(std_host_load);
 +		return cpu;
 +	}
 +
@@ -920,45 +581,18 @@ index 000000000..4517dc6f5
 +	}
 +	if (!has_out_group) {
 +		this_cpu_inc(std_fallback);
-+		this_cpu_inc(std_bulk);
-+		this_cpu_inc(std_decaying);
-+		this_cpu_inc(std_host_load);
 +		return cpu;
 +	}
 +
-+	if (!std_flow_consume(p, f)) {
-+		dest = std_flow_rank(f, p->cpus_ptr, hk, false, quantum, cpu);
-+		if (dest >= nr_cpu_ids) {
-+			this_cpu_inc(std_fallback);
-+			this_cpu_inc(std_bulk);
-+			this_cpu_inc(std_decaying);
-+			this_cpu_inc(std_host_load);
-+			return cpu;
-+		}
-+		this_cpu_inc(std_denied);
-+		this_cpu_inc(std_steered);
-+		this_cpu_inc(std_bulk);
-+		this_cpu_inc(std_decaying);
-+		this_cpu_inc(std_host_load);
-+		return dest;
-+	}
-+
-+	dest = std_flow_rank(f, p->cpus_ptr, hk, false, quantum, cpu);
-+	if (dest >= nr_cpu_ids) {
++	dest = std_rank(p->cpus_ptr, hk, false, cpu);
++	if (dest >= nr_cpu_ids || !cpu_active(dest)) {
 +		this_cpu_inc(std_fallback);
-+		this_cpu_inc(std_bulk);
-+		this_cpu_inc(std_decaying);
-+		this_cpu_inc(std_host_load);
 +		return cpu;
 +	}
 +	if ((int)dest == cpu)
 +		this_cpu_inc(std_fastpath);
 +	else
 +		this_cpu_inc(std_steered);
-+	this_cpu_inc(std_enforced);
-+	this_cpu_inc(std_bulk);
-+	this_cpu_inc(std_decaying);
-+	this_cpu_inc(std_host_load);
 +	return dest;
 +}
 +
@@ -968,11 +602,10 @@ index 000000000..4517dc6f5
 + * and core-scheduled tasks (rq-wide check, may over-skip) pass
 + * through. Extensible tasks defer to the SCX dispatch queue. Small
 + * systems with fewer than three online CPUs pass through. Deadline
-+ * and real-time tasks prefer non-housekeeping CPUs with deficit
-+ * enforcement; fair and idle tasks prefer housekeeping CPUs with
-+ * deficit enforcement. Cross-group picks are denied only when an
++ * and real-time tasks prefer non-housekeeping CPUs with SMT-aware
++ * selection; fair and idle tasks prefer housekeeping CPUs with
++ * SMT-aware selection. Cross-group picks are denied only when an
 + * in-group allowed CPU exists, otherwise the class CPU is kept.
-+ * Imminent DL/RT tasks bypass enforcement.
 + */
 +int std_select_cpu(struct task_struct *p, int cpu)
 +{
@@ -1026,10 +659,10 @@ index 000000000..4517dc6f5
 +}
 diff --git a/kernel/sched/std.h b/kernel/sched/std.h
 new file mode 100644
-index 000000000..832980c28
+index 000000000..8b3741939
 --- /dev/null
 +++ b/kernel/sched/std.h
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,36 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * Smart Task Distributor (STD) routing shim.
@@ -1037,9 +670,7 @@ index 000000000..832980c28
 + * Steers wakeup placement above the deadline class with no new
 + * scheduling class. Fair and idle tasks prefer housekeeping CPUs
 + * while deadline and real-time tasks prefer non-housekeeping CPUs
-+ * with Cake-style deficit sharing. Per-task flows are hashed into a
-+ * per-CPU 1024-entry 8-way table and charged quantums derived from
-+ * base_quantum_ns with per-tin shifts. Cross-group picks are denied
++ * with SMT-aware idle selection. Cross-group picks are denied
 + * only when an in-group allowed CPU exists, otherwise the original
 + * CPU is kept. Affinity is honored with fallback to the
 + * class-selected CPU. Extensible tasks defer to SCX; core check is
@@ -1052,37 +683,9 @@ index 000000000..832980c28
 +
 +#include <linux/sched.h>
 +
-+/* Flow table geometry: 128 sets x 8 ways = 1024 flows. */
-+#define STD_FLOWS	1024
-+#define STD_WAYS	8
-+#define STD_SETS	(STD_FLOWS / STD_WAYS)
-+
-+/* Cap for per-flow deficit credits (bounds growth, shifts only). */
-+#define STD_HOST_LOAD_MAX	1000000UL
-+
-+/* Max traffic identifiers (indexes std_div_shift[8]). */
-+#define STD_TIN_MAX	8
-+
-+/*
-+ * Cake-style traffic identifiers. SPARSE covers fair/idle wakeups,
-+ * BULK covers deadline/real-time wakeups; IMMINENT/HIGH are urgent
-+ * DL/RT subsets that bypass enforcement to avoid starvation. SPARE
-+ * tins are reserved for future classes and use larger shifts.
-+ */
-+enum std_tin {
-+	STD_TIN_IDLE		= 0,
-+	STD_TIN_FAIR		= 1,
-+	STD_TIN_DL		= 2,
-+	STD_TIN_RT		= 3,
-+	STD_TIN_DL_IMMINENT	= 4,
-+	STD_TIN_RT_HIGH		= 5,
-+	STD_TIN_SPARE6		= 6,
-+	STD_TIN_SPARE7		= 7,
-+};
-+
 +#ifdef CONFIG_SMART_TASK_DISTRIBUTOR
 +/*
-+ * Master switch: 1 enables deficit enforcement (default), 0 disables
++ * Master switch: 1 enables steering (default), 0 disables
 + * steering (near-zero cost). Clamped 0-1 via sysctl minmax and
 + * std_running= boot param (plain 0 or 1 only).
 + */

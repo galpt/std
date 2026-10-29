@@ -7,7 +7,7 @@ Add SMART_TASK_DISTRIBUTOR behind kernel/Kconfig.preempt with
 default y. The shim stays above deadline and never adds a new
 scheduling class. Fair and idle tasks prefer housekeeping while
 deadline plus real-time tasks prefer non-housekeeping; steering uses
-deficit enforcement with affinity-safe fallback, EXT defers to SCX
+SMT-aware idle selection with affinity-safe fallback, EXT defers to SCX
 and the core check is rq-wide and may over-skip. Default on keeps
 single image behavior simple.
 
@@ -32,7 +32,7 @@ index f294dad43..442ff2c2e 100644
 +	  Route tasks above the deadline class without adding a new
 +	  scheduling class. Fair and idle tasks prefer housekeeping and
 +	  deadline plus real-time tasks prefer non-housekeeping CPUs.
-+	  Steering uses deficit enforcement with affinity-safe fallback; EXT defers
++	  Steering uses SMT-aware idle selection with affinity-safe fallback; EXT defers
 +	  to SCX, core rq-wide may over-skip, affinity/small honored, toggle via std_running.
 -- 
 2.56.0

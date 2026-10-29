@@ -5,8 +5,8 @@ Subject: [PATCH 2/4] STD: wire build and sched.h include
 
 Wire std.o behind CONFIG_SMART_TASK_DISTRIBUTOR and include
 std.h from sched.h. Keeps build parallel and keeps routing above
-deadline with no new scheduling class; steering uses deficit
-enforcement.
+deadline with no new scheduling class; steering uses SMT-aware
+idle selection.
 
 Signed-off-by: Galih Tama <galpt@v.recipes>
 ---

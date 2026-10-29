@@ -6,8 +6,8 @@ Subject: [PATCH 4/4] STD: hook select_task_rq
 Hook select_task_rq via std_select_cpu. Keeps routing above deadline
 with no new class. Respects affinity and small-system guard; pinned,
 migrating, core (rq-wide, may over-skip) and EXT pass through, stop
-never intercepted. Enforces deficit sharing denying cross-group only
-when in-group allowed exists, with DL/RT imminent bypass. Placement
+never intercepted. Steers with SMT-aware idle selection denying
+cross-group only when in-group allowed exists. Placement
 stays at wakeup time; the pick path is untouched so the disabled cost
 is near-zero.
 
@@ -25,8 +25,8 @@ index 1754d9f95..5e3a7ac66 100644
  	if (p->nr_cpus_allowed > 1 && !is_migration_disabled(p)) {
  		cpu = p->sched_class->select_task_rq(p, cpu, *wake_flags);
 +		/*
-+		 * STD routing shim above deadline: Cake-style deficit
-+		 * enforcement for the preferred group, denying cross-group
++		 * STD routing shim above deadline: SMT-aware idle
++		 * selection for the preferred group, denying cross-group
 +		 * only when in-group allowed exists; honoring affinity; stop
 +		 * never intercepted, pinned/migrating/core(rq-wide, may
 +		 * over-skip)/EXT pass through. Wakeup only; pick untouched.
