@@ -1,33 +1,43 @@
-From: STD Team <std@kernel.org>
-Date: Sat, 18 Oct 2026 00:00:00 +0000
+From d4abd66550518a69cec06b26f1da4646b4a8ebd3 Mon Sep 17 00:00:00 2001
+From: Galih Tama <galpt@v.recipes>
+Date: Thu, 29 Oct 2026 01:49:46 +0700
 Subject: [PATCH 3/4] STD: add routing shim with sysctl, stats and boot param
 
-Add kernel/sched/std.c and std.h. Fair tasks prefer housekeeping
-CPUs while deadline plus real-time tasks prefer non-housekeeping
-CPUs. Intersect with p->cpus_ptr and fall back when empty. Stop
-never intercepted. Pinned, migrate-disabled and core-scheduled
-pass through. EXT defers to SCX. Guard small systems.
+Add kernel/sched/std.c and std.h above deadline. Fair and idle tasks
+prefer housekeeping CPUs while deadline plus real-time tasks prefer
+non-housekeeping CPUs. Intersect with p->cpus_ptr and fall back when
+empty. Stop never intercepted. Pinned, migrate-disabled and
+core-scheduled (rq-wide, may over-skip) pass through. EXT defers to
+SCX. Guard small systems.
 
-Idle-aware search prefers idle CPUs and distributes the pick so
-concurrent wakeups do not funnel onto one CPU. Steering is a soft
-hint, never a hard partition. Per-CPU fastpath, steered and
-fallback counters report via kernel.std_stats with no atomics or
-allocations on the wakeup path.
+Idle-aware search prefers idle CPUs and spreads picks best-effort
+without guarantee. Steering is a best-effort soft hint, never a hard
+partition. Per-CPU fastpath, steered and fallback counters report via
+kernel.std_stats with no atomics or allocations on the wakeup path.
 
 Expose kernel.std_running 0644 minmax and read-only kernel.std_stats
-via register_sysctl_init and late_initcall. Add std_running= boot
-param limited to plain 0 or 1 plus kernel-parameters documentation.
+via register_sysctl_init and late_initcall. The init variant sizes
+the table with ARRAY_SIZE, so no zero sentinel is stored. The stats
+handler keeps the proc contract: ssize_t result, *lenp update,
+return 0. Add std_running= boot param limited to plain 0 or 1 plus
+kernel-parameters documentation. Design-tracking TODO(hard-50-50)
+comments point to the repo tracker; hard-halves enforcement stays
+unimplemented.
 
-Signed-off-by: STD Team <std@kernel.org>
+Signed-off-by: Galih Tama <galpt@v.recipes>
 ---
- Documentation/admin-guide/kernel-parameters.txt |   4 ++++
- kernel/sched/std.c                              | 432 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
- kernel/sched/std.h                              |  26 ++++++++++++++++++++++++++
- 3 files changed, 462 insertions(+)
+ .../admin-guide/kernel-parameters.txt         |   4 +
+ kernel/sched/std.c                            | 444 +++++++++++++++++++
+ kernel/sched/std.h                            |  32 +++
+ 3 files changed, 480 insertions(+)
+ create mode 100644 kernel/sched/std.c
+ create mode 100644 kernel/sched/std.h
 
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index e75344f4e..fa385199a 100644
 --- a/Documentation/admin-guide/kernel-parameters.txt
 +++ b/Documentation/admin-guide/kernel-parameters.txt
-@@ -7424,6 +7424,10 @@
+@@ -7424,6 +7424,10 @@ Kernel parameters
  			tracing directory. Note, this enables stack tracing
  			and the stacktrace above is not needed.
  
@@ -38,23 +48,32 @@ Signed-off-by: STD Team <std@kernel.org>
  	sti=		[PARISC,HW]
  			Format: <num>
  			Set the STI (builtin display/keyboard on the HP-PARISC
+diff --git a/kernel/sched/std.c b/kernel/sched/std.c
+new file mode 100644
+index 000000000..5522dc6f5
 --- /dev/null
 +++ b/kernel/sched/std.c
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,444 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Smart Task Distributor (STD) routing shim.
 + *
 + * STD is a lightweight routing shim above the deadline class. It does
-+ * not introduce a new scheduling class. On wakeup it steers fair tasks
-+ * toward housekeeping CPUs and deadline plus real-time tasks toward
-+ * non-housekeeping CPUs. The shim honors affinity, leaves stop tasks
-+ * untouched and stays off on small systems with fewer than three
-+ * online CPUs.
++ * not introduce a new scheduling class. On wakeup it steers fair and
++ * idle tasks toward housekeeping CPUs and deadline plus real-time
++ * tasks toward non-housekeeping CPUs. The shim honors affinity via
++ * cpumask intersection, leaves stop tasks untouched, defers
++ * extensible tasks to SCX, and stays off on small systems with fewer
++ * than three online CPUs. Pinned, migrate-disabled and core-scheduled
++ * pass through; the core check is rq-wide and may over-skip.
 + *
-+ * Steering is a soft hint, not a hard partition: the preferred group
-+ * is honored only when the task may run there, otherwise the
-+ * class-selected CPU is kept.
++ * Steering is a best-effort soft hint, not a hard partition: the
++ * preferred group is honored only when the task may run there,
++ * otherwise the class-selected CPU is kept, and idle spreading is
++ * attempted without guarantee.
++ *
++ * TODO(hard-50-50): strict-halves grouping is design-tracked only,
++ * see docs/hard-50-50-todo.md. No logic change yet; soft hint stays.
 + */
 +#include <linux/cpu.h>
 +#include <linux/cpumask_api.h>
@@ -130,7 +149,7 @@ Signed-off-by: STD Team <std@kernel.org>
 +	size_t need, off = 0;
 +	int w0, w1, w2, i;
 +	int cpu;
-+	int ret;
++	ssize_t ret;
 +
 +	/* Reject writes; the counters are read-only. */
 +	if (dir)
@@ -224,7 +243,10 @@ Signed-off-by: STD Team <std@kernel.org>
 +	ret = memory_read_from_buffer(buf, *lenp, ppos, kbuf, off);
 +	kfree(kbuf);
 +	kfree(widths);
-+	return ret;
++	if (ret < 0)
++		return ret;
++	*lenp = ret;
++	return 0;
 +}
 +
 +/*
@@ -247,7 +269,6 @@ Signed-off-by: STD Team <std@kernel.org>
 +		.mode		= 0444,
 +		.proc_handler	= proc_std_stats,
 +	},
-+	{}
 +};
 +
 +/*
@@ -302,8 +323,8 @@ Signed-off-by: STD Team <std@kernel.org>
 +}
 +
 +/*
-+ * Pick a housekeeping CPU for fair tasks. Intersect the housekeeping
-+ * mask with p->cpus_ptr via cpumask_and semantics. Empty intersection
++ * Pick a housekeeping CPU for fair and idle tasks. Intersect
++ * housekeeping mask with p->cpus_ptr; empty intersection
 + * falls back to the original CPU so taskset affinity is never broken.
 + */
 +static int std_pick_housekeeping(struct task_struct *p, int cpu)
@@ -328,9 +349,9 @@ Signed-off-by: STD Team <std@kernel.org>
 +
 +	/*
 +	 * Slow path: prefer an idle CPU in p->cpus_ptr and
-+	 * housekeeping, else distribute the pick so wakeups do not
-+	 * funnel onto one CPU. Fall back to the original CPU when
-+	 * the intersection is empty or unusable. Steering is a soft
++	 * housekeeping, else spread the pick best-effort without
++	 * guarantee. Fall back to the original CPU when the
++	 * intersection is empty or unusable. Steering is a soft
 +	 * hint, never a hard partition.
 +	 */
 +	dest = std_pick_idle_in(p->cpus_ptr, hk);
@@ -373,12 +394,11 @@ Signed-off-by: STD Team <std@kernel.org>
 +
 +	/*
 +	 * Slow path: prefer an idle CPU in p->cpus_ptr outside
-+	 * housekeeping, else distribute the pick so wakeups do not
-+	 * funnel onto one CPU. Fall back to the original CPU when
-+	 * the intersection is empty or unusable. Steering is a soft
-+	 * hint, never a hard partition. Uses the shared distributor
-+	 * symmetric to the fair path, wrapping from the distributed
-+	 * start so concurrent wakeups spread.
++	 * housekeeping, else spread the pick best-effort without
++	 * guarantee. Fall back to the original CPU when the
++	 * intersection is empty or unusable. Steering is a soft
++	 * hint, never a hard partition. Uses a cpumask_any_distribute
++	 * start symmetric to the fair path, wrapping to spread picks.
 +	 */
 +	dest = std_pick_idle_not_hk(p->cpus_ptr, hk);
 +	if (dest < nr_cpu_ids) {
@@ -386,7 +406,7 @@ Signed-off-by: STD Team <std@kernel.org>
 +		return dest;
 +	}
 +
-+	/* No idle CPU usable: distribute across p->cpus_ptr not in hk. */
++	/* No idle CPU usable: spread across p->cpus_ptr not in hk. */
 +	{
 +		unsigned int start = cpumask_any_distribute(p->cpus_ptr);
 +		unsigned int iter;
@@ -417,11 +437,16 @@ Signed-off-by: STD Team <std@kernel.org>
 +}
 +
 +/*
-+ * Route a wakeup to the preferred CPU group. Stop tasks are never
-+ * intercepted. Pinned tasks, migrate-disabled tasks and core-schedul-
-+ * ed tasks pass through. Extensible tasks defer to the SCX dispatch
-+ * queue. Small systems with fewer than three online CPUs pass
-+ * through to preserve balance.
++ * Route a wakeup to the preferred CPU group above deadline. Stop
++ * tasks are never intercepted. Pinned tasks, migrate-disabled tasks
++ * and core-scheduled tasks (rq-wide check, may over-skip) pass
++ * through. Extensible tasks defer to the SCX dispatch queue. Small
++ * systems with fewer than three online CPUs pass through to preserve
++ * balance. Steering is a best-effort soft hint without guarantee.
++ *
++ * TODO(hard-50-50): future strict-halves enforcement would hook here
++ * (deny cross-half picks where affinity allows); tracked in
++ * docs/hard-50-50-todo.md. Current code keeps the soft hint only.
 + */
 +int std_select_cpu(struct task_struct *p, int cpu)
 +{
@@ -449,10 +474,10 @@ Signed-off-by: STD Team <std@kernel.org>
 +		return cpu;
 +
 +	/*
-+	 * Core-scheduled tasks must stay together. Peek at the
-+	 * destination runqueue: select_task_rq runs with the task
-+	 * pi_lock held, so this is a benign racy read that only ever
-+	 * skips steering.
++	 * Core check is rq-wide and may over-skip: tasks on a core-scheduled
++	 * runqueue must stay together. Peek at the destination runqueue:
++	 * select_task_rq runs with the task pi_lock held, so this is a
++	 * benign racy read that only ever skips steering.
 +	 */
 +	if (sched_core_enabled(cpu_rq(cpu)))
 +		return cpu;
@@ -473,18 +498,27 @@ Signed-off-by: STD Team <std@kernel.org>
 +
 +	return cpu;
 +}
+diff --git a/kernel/sched/std.h b/kernel/sched/std.h
+new file mode 100644
+index 000000000..83701f7c8
 --- /dev/null
 +++ b/kernel/sched/std.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,32 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * Smart Task Distributor (STD) routing shim.
 + *
 + * STD sits above the deadline class and steers wakeup placement
-+ * without adding a new scheduling class. Fair tasks prefer
++ * without adding a new scheduling class. Fair and idle tasks prefer
 + * housekeeping CPUs while deadline and real-time tasks prefer
-+ * non-housekeeping CPUs. The shim respects affinity and stays
-+ * off on small systems.
++ * non-housekeeping CPUs. Steering is a best-effort soft hint, never
++ * a hard partition: spreading is attempted without guarantee.
++ * Affinity is honored with fallback to the class-selected CPU.
++ * Extensible tasks defer to SCX; core check is rq-wide and may
++ * over-skip. Small systems stay off.
++ *
++ * TODO(hard-50-50): strict-halves grouping is design-tracked only,
++ * see docs/hard-50-50-todo.md. No logic change yet; soft hint stays.
 + */
 +#ifndef _KERNEL_SCHED_STD_H
 +#define _KERNEL_SCHED_STD_H
@@ -502,3 +536,6 @@ Signed-off-by: STD Team <std@kernel.org>
 +#endif /* CONFIG_SMART_TASK_DISTRIBUTOR */
 +
 +#endif /* _KERNEL_SCHED_STD_H */
+-- 
+2.56.0
+

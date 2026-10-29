@@ -110,8 +110,9 @@ fi
 
 # Confinement: canonicalize dirs and refuse root, empty, same or nested dirs.
 # realpath -m (missing-ok) is intentional: it supports mocked --boot-dir paths
-# that may not exist yet. Safety comes from the refuse-root/same/nested guards
-# below, not from existence checks, so -m does not weaken confinement.
+# that may not exist yet. Canonicalizes symlinks before same/nested checks.
+# Safety comes from the refuse-root/same/nested guards below, not from
+# existence checks, so -m does not weaken confinement.
 if command -v realpath >/dev/null 2>&1; then
 	KERNEL_DIR="$(realpath -m -- "${KERNEL_DIR}")"
 	BOOT_DIR="$(realpath -m -- "${BOOT_DIR}")"
@@ -136,9 +137,9 @@ case "${BOOT_DIR}/" in
 	"${KERNEL_DIR}/"*) echo "Refusing nested BOOT_DIR under KERNEL_DIR" >&2; exit 1 ;;
 esac
 
-# Allowlisted release/token check: ^[A-Za-z0-9._+-]+$ (no slash, no glob, no empty).
+# Allowlisted release/token check: ^[A-Za-z0-9._][A-Za-z0-9._+-]*$ (no slash, no glob, no empty, no leading dash).
 is_safe_ver() {
-	printf '%s' "${1:-}" | grep -Eq '^[A-Za-z0-9._+-]+$'
+	printf '%s' "${1:-}" | grep -Eq '^[A-Za-z0-9._][A-Za-z0-9._+-]*$'
 }
 
 # Limine 4-candidate parity with install.sh (direct + sudo -n).
@@ -430,7 +431,7 @@ uninstall_status() {
 }
 
 # Limine STD-block removal with backup + tree/update refresh and rollback.
-# Automated (prefer tool-driven, filtered fallback); fail-closed on sudo/backup.
+# Automated (prefer tool-driven, filtered fallback); fail-closed on sudo -n/backup.
 # Never in --dry-run/--status. Verifies target_ver absent, rolls back on failure.
 # 4-candidate parity with install.sh: limine.conf, limine/limine.conf,
 # EFI/BOOT/limine.conf, boot/limine.conf under BOOT_DIR.
@@ -543,7 +544,7 @@ remove_limine_entry() {
 				continue
 			fi
 		else
-			# shellcheck disable=SC2024 # sudo applies to cat (root read); redirect targets user-owned tmpfile by design
+			# shellcheck disable=SC2024 # sudo -n applies to cat (root read); redirect targets user-owned tmpfile by design
 			if ! sudo -n cat -- "${limine_conf}" >"${tmpfile}" 2>/dev/null; then
 				echo "WARNING: cannot read ${limine_conf} via sudo -n; restoring backup." >&2
 				sudo -n cp -a -- "${backup}" "${limine_conf}" || true
@@ -615,7 +616,7 @@ do_remove() {
 			;;
 	esac
 	if ! is_safe_ver "${target_ver}"; then
-		echo "Refusing unsafe release for --remove (allowlist ^[A-Za-z0-9._+-]+\$): ${target_ver}" >&2
+		echo "Refusing unsafe release for --remove (allowlist ^[A-Za-z0-9._][A-Za-z0-9._+-]*\$): ${target_ver}" >&2
 		return 1
 	fi
 	running=""
@@ -676,7 +677,7 @@ do_remove() {
 			echo "No BLS entries for ${target_ver} in ${bls_dir}."
 		fi
 	fi
-	# Limine STD-block removal (automated with backup; fail-closed on sudo/backup).
+	# Limine STD-block removal (automated with backup; fail-closed on sudo -n/backup).
 	remove_limine_entry "${target_ver}" || return 1
 	# Allowlisted modules dir (exact path only, no nesting, allowlisted ver).
 	mod_dir="/lib/modules/${target_ver}"
@@ -910,9 +911,19 @@ while IFS= read -r patch; do
 	fi
 	CHECKPATCH="${KERNEL_DIR}/scripts/checkpatch.pl"
 	if [ -f "${CHECKPATCH}" ] && command -v perl >/dev/null 2>&1; then
-		if ! perl "${CHECKPATCH}" --strict --no-tree "${PATCH_FILE}" >/dev/null 2>&1; then
+		# stdin (- < file) avoids git_is_single_file file-mode: a tracked
+		# patch passed as argv would diff -u /dev/null and flag patch
+		# formatting as errors. --ignore FILE_PATH_CHANGES scoped to 0003 only
+		# (0003 adds kernel/sched/std.c/std.h by design; MAINTAINERS update N/A).
+		CHECKPATCH_IGNORE=""
+		case "${patch}" in
+			0003-*) CHECKPATCH_IGNORE="--ignore FILE_PATH_CHANGES" ;;
+		esac
+		# shellcheck disable=SC2086 # CHECKPATCH_IGNORE is empty or one allowlisted flag.
+		if ! perl "${CHECKPATCH}" --strict --no-tree ${CHECKPATCH_IGNORE} - < "${PATCH_FILE}" >/dev/null 2>&1; then
 			echo "checkpatch --strict failed for ${patch}" >&2
-			perl "${CHECKPATCH}" --strict --no-tree "${PATCH_FILE}" 2>&1 | head -n 20 >&2 || true
+			# shellcheck disable=SC2086 # See above.
+			perl "${CHECKPATCH}" --strict --no-tree ${CHECKPATCH_IGNORE} - < "${PATCH_FILE}" 2>&1 | head -n 20 >&2 || true
 			FAILED=1
 		fi
 	fi

@@ -199,9 +199,20 @@ Expect:
 
 ```bash
 sudo -n stat -c %s /boot/initramfs-7.3.0-std.img
-find /lib/modules/7.3.0-std -name *.ko* | wc -l
+find /lib/modules/7.3.0-std -name '*.ko*' | wc -l
 sudo -n grep STD /boot/limine.conf
 sudo -n grep 7.3.0-std /boot/limine.conf
+```
+
+```bash
+taskset -c 0 sleep 0
+taskset -p $$
+```
+
+```bash
+sudo -n modinfo -k 7.3.0-std -F filename nvidia
+sudo -n find /lib/modules/7.3.0-std -name 'nvidia.ko*'
+dkms status
 ```
 
 Expect:
@@ -225,6 +236,13 @@ Expect:
   filtered STD-block fallback with backup/rollback otherwise) and re-verify
   before reboot. GRUB `mkconfig` + verify, BLS verify-only unless
   `--write-bls`.
+- f. Affinity smoke-test: `taskset -c 0 sleep 0` plus `taskset -p $$`
+  (1–2 CPU systems pass through unchanged; steering is best-effort soft hint).
+- g. NVIDIA DKMS: `sudo -n modinfo -k 7.3.0-std -F filename nvidia` prints
+  the `nvidia.ko` path (`find` fallback when `modinfo` misses); `dkms status`
+  lists `nvidia/... , 7.3.0-std, x86_64: installed`. Mirrors `dkms_post`
+  (`dkms_pre` scoped to `-k <ver>` → `autoinstall -k` → explicit `install -f`
+  fallback → `depmod -a` → `modinfo`/`find` verify).
 
 ## Failure handling
 

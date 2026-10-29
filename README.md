@@ -2,9 +2,9 @@
 
 ## Overview
 
-STD aims to provide better desktop interactivity by trying to better distribute higher priority tasks such as tasks handled by the DL and RT schedulers to not badly impact normal or lower priority tasks such as tasks handled by the Fair and sched-ext schedulers.
+STD aims to provide better desktop interactivity by best-effort spreading of DL and RT tasks away from Fair and idle tasks; extensible (EXT) tasks defer to SCX and are not steered.
 
-STD steers wakeups without a new scheduling class. Fair and idle tasks prefer housekeeping CPUs. Deadline and real-time tasks prefer non-housekeeping CPUs. Affinity uses `cpumask` intersection with fallback soft hint. Stop tasks are never intercepted while pinned, migrate-disabled and core-scheduled pass through.
+STD steers wakeups above deadline without a new scheduling class. Fair and idle tasks prefer housekeeping CPUs. Deadline and real-time tasks prefer non-housekeeping CPUs. Affinity uses `cpumask` intersection with fallback soft hint and best-effort spreading without guarantee. Stop tasks are never intercepted while pinned, migrate-disabled, core-scheduled (rq-wide, may over-skip) and EXT pass through.
 
 > [!NOTE]
 > STD will disable itself for machines with less than 3 cores.
@@ -59,19 +59,19 @@ uname -r
 sysctl kernel.std_running
 # expect 1
 cat /proc/sys/kernel/std_running /proc/sys/kernel/std_stats
-# expect 1 plus bordered table with fastpath / steered / fallback
+# expect 1 plus approximate bordered table with fastpath / steered / fallback
 taskset -c 0 sleep 0
 taskset -p $$
 ```
 
-Confirm with `patch --dry-run`, `git apply --check` and `checkpatch.pl --strict`. Build scheduler objects and test affinity with `taskset`.
+Confirm with `patch --dry-run`, `git apply --check` and `checkpatch.pl --strict` (near-zero disabled cost when off). Build scheduler objects and test affinity with `taskset`; steering is best-effort soft hint.
 
 ## Tunables
 
 | Tunable | Path | Range | Default | Description |
 |---|---|---|---|---|
-| `std_running` | `/proc/sys/kernel/std_running` | `0` or `1` | `1` | Master switch. `0` disables steering, `1` enables. |
-| `std_stats` | `/proc/sys/kernel/std_stats` | — | — | Dynamic-width bordered table of per-CPU sums (`fastpath`, `steered`, `fallback`); `slab.h`, `kmalloc_array` + `kmalloc` + `kfree`, measured widths, `memory_read_from_buffer`. |
+| `std_running` | `/proc/sys/kernel/std_running` | `0` or `1` | `1` | Master switch. `0` disables steering (near-zero cost), `1` enables best-effort soft hint. |
+| `std_stats` | `/proc/sys/kernel/std_stats` | — | — | Dynamic-width bordered approximate table of per-CPU sums (`fastpath`, `steered`, `fallback`); `slab.h`, `kmalloc_array` + `kmalloc` + `kfree`, measured widths, `memory_read_from_buffer`. |
 
 > [!TIP]
 > This is optional. After booting the STD entry, verify steering without changing boot config via `cat`, `taskset`, and `sysctl` above (restore to `1` afterwards).
@@ -82,12 +82,12 @@ Confirm with `patch --dry-run`, `git apply --check` and `checkpatch.pl --strict`
 flowchart TD
     A[select_task_rq wakeup] --> B{std_running?}
     B -- 0 --> Z[keep class CPU]
-    B -- 1 --> C{isolation? small? stop? pinned? migrating? core? EXT?}
+    B -- 1 --> C{isolation? small? stop? pinned? migrating? core(rq-wide)? EXT?} %% guards in code order
     C -- passthrough --> Z
     C -- steerable --> D{dl or rt?}
-    D -- yes --> E[prefer non-housekeeping idle, distribute, fallback]
+    D -- yes --> E[prefer non-housekeeping idle, best-effort spread, fallback]
     D -- no --> F{idle or fair?}
-    F -- yes --> G[prefer housekeeping idle, distribute, fallback]
+    F -- yes --> G[prefer housekeeping idle, best-effort spread, fallback]
     F -- no --> Z
     E --> H[fastpath / steered / fallback counters]
     G --> H
@@ -99,8 +99,8 @@ flowchart TD
 | Feature | Vanilla Kernel | With STD | sched-ext |
 |---|---|---|---|
 | New scheduling class | — | No (shim above deadline) | Yes (`sched_ext`) |
-| Fair/idle prefer housekeeping | No | Yes (soft hint, affinity-safe) | Policy-dependent |
-| Deadline/RT prefer non-housekeeping | No | Yes (idle + distribute) | Policy-dependent |
+| Fair/idle prefer housekeeping | No | Yes (soft hint, best-effort, affinity-safe) | Policy-dependent |
+| Deadline/RT prefer non-housekeeping | No | Yes (idle + best-effort spread) | Policy-dependent |
 | Small-system guard (<3 CPUs) | — | Pass-through | Varies |
 | Live toggle | — | `kernel.std_running` + `std_running=` | Varies |
 | Read-only stats table | — | `kernel.std_stats` bordered, `-EROFS` on write | Varies |

@@ -28,5 +28,6 @@ vmlinux
 *.bak
 *.log
 
-# Unnecessary for now.
-docs/
+# Docs are mostly local, except the canonical hard-50-50 tracker.
+docs/*
+!docs/hard-50-50-todo.md

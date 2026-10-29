@@ -3,15 +3,21 @@
  * Smart Task Distributor (STD) routing shim.
  *
  * STD is a lightweight routing shim above the deadline class. It does
- * not introduce a new scheduling class. On wakeup it steers fair tasks
- * toward housekeeping CPUs and deadline plus real-time tasks toward
- * non-housekeeping CPUs. The shim honors affinity, leaves stop tasks
- * untouched and stays off on small systems with fewer than three
- * online CPUs.
+ * not introduce a new scheduling class. On wakeup it steers fair and
+ * idle tasks toward housekeeping CPUs and deadline plus real-time
+ * tasks toward non-housekeeping CPUs. The shim honors affinity via
+ * cpumask intersection, leaves stop tasks untouched, defers
+ * extensible tasks to SCX, and stays off on small systems with fewer
+ * than three online CPUs. Pinned, migrate-disabled and core-scheduled
+ * pass through; the core check is rq-wide and may over-skip.
  *
- * Steering is a soft hint, not a hard partition: the preferred group
- * is honored only when the task may run there, otherwise the
- * class-selected CPU is kept.
+ * Steering is a best-effort soft hint, not a hard partition: the
+ * preferred group is honored only when the task may run there,
+ * otherwise the class-selected CPU is kept, and idle spreading is
+ * attempted without guarantee.
+ *
+ * TODO(hard-50-50): strict-halves grouping is design-tracked only,
+ * see docs/hard-50-50-todo.md. No logic change yet; soft hint stays.
  */
 #include <linux/cpu.h>
 #include <linux/cpumask_api.h>
@@ -87,7 +93,7 @@ static int proc_std_stats(const struct ctl_table *table, int dir,
 	size_t need, off = 0;
 	int w0, w1, w2, i;
 	int cpu;
-	int ret;
+	ssize_t ret;
 
 	/* Reject writes; the counters are read-only. */
 	if (dir)
@@ -181,7 +187,10 @@ static int proc_std_stats(const struct ctl_table *table, int dir,
 	ret = memory_read_from_buffer(buf, *lenp, ppos, kbuf, off);
 	kfree(kbuf);
 	kfree(widths);
-	return ret;
+	if (ret < 0)
+		return ret;
+	*lenp = ret;
+	return 0;
 }
 
 /*
@@ -204,7 +213,6 @@ static const struct ctl_table std_sysctls[] = {
 		.mode		= 0444,
 		.proc_handler	= proc_std_stats,
 	},
-	{}
 };
 
 /*
@@ -259,8 +267,8 @@ static unsigned int std_pick_idle_not_hk(const struct cpumask *task,
 }
 
 /*
- * Pick a housekeeping CPU for fair tasks. Intersect the housekeeping
- * mask with p->cpus_ptr via cpumask_and semantics. Empty intersection
+ * Pick a housekeeping CPU for fair and idle tasks. Intersect
+ * housekeeping mask with p->cpus_ptr; empty intersection
  * falls back to the original CPU so taskset affinity is never broken.
  */
 static int std_pick_housekeeping(struct task_struct *p, int cpu)
@@ -285,9 +293,9 @@ static int std_pick_housekeeping(struct task_struct *p, int cpu)
 
 	/*
 	 * Slow path: prefer an idle CPU in p->cpus_ptr and
-	 * housekeeping, else distribute the pick so wakeups do not
-	 * funnel onto one CPU. Fall back to the original CPU when
-	 * the intersection is empty or unusable. Steering is a soft
+	 * housekeeping, else spread the pick best-effort without
+	 * guarantee. Fall back to the original CPU when the
+	 * intersection is empty or unusable. Steering is a soft
 	 * hint, never a hard partition.
 	 */
 	dest = std_pick_idle_in(p->cpus_ptr, hk);
@@ -330,12 +338,11 @@ static int std_pick_non_housekeeping(struct task_struct *p, int cpu)
 
 	/*
 	 * Slow path: prefer an idle CPU in p->cpus_ptr outside
-	 * housekeeping, else distribute the pick so wakeups do not
-	 * funnel onto one CPU. Fall back to the original CPU when
-	 * the intersection is empty or unusable. Steering is a soft
-	 * hint, never a hard partition. Uses the shared distributor
-	 * symmetric to the fair path, wrapping from the distributed
-	 * start so concurrent wakeups spread.
+	 * housekeeping, else spread the pick best-effort without
+	 * guarantee. Fall back to the original CPU when the
+	 * intersection is empty or unusable. Steering is a soft
+	 * hint, never a hard partition. Uses a cpumask_any_distribute
+	 * start symmetric to the fair path, wrapping to spread picks.
 	 */
 	dest = std_pick_idle_not_hk(p->cpus_ptr, hk);
 	if (dest < nr_cpu_ids) {
@@ -343,7 +350,7 @@ static int std_pick_non_housekeeping(struct task_struct *p, int cpu)
 		return dest;
 	}
 
-	/* No idle CPU usable: distribute across p->cpus_ptr not in hk. */
+	/* No idle CPU usable: spread across p->cpus_ptr not in hk. */
 	{
 		unsigned int start = cpumask_any_distribute(p->cpus_ptr);
 		unsigned int iter;
@@ -374,11 +381,16 @@ static int std_pick_non_housekeeping(struct task_struct *p, int cpu)
 }
 
 /*
- * Route a wakeup to the preferred CPU group. Stop tasks are never
- * intercepted. Pinned tasks, migrate-disabled tasks and core-schedul-
- * ed tasks pass through. Extensible tasks defer to the SCX dispatch
- * queue. Small systems with fewer than three online CPUs pass
- * through to preserve balance.
+ * Route a wakeup to the preferred CPU group above deadline. Stop
+ * tasks are never intercepted. Pinned tasks, migrate-disabled tasks
+ * and core-scheduled tasks (rq-wide check, may over-skip) pass
+ * through. Extensible tasks defer to the SCX dispatch queue. Small
+ * systems with fewer than three online CPUs pass through to preserve
+ * balance. Steering is a best-effort soft hint without guarantee.
+ *
+ * TODO(hard-50-50): future strict-halves enforcement would hook here
+ * (deny cross-half picks where affinity allows); tracked in
+ * docs/hard-50-50-todo.md. Current code keeps the soft hint only.
  */
 int std_select_cpu(struct task_struct *p, int cpu)
 {
@@ -406,10 +418,10 @@ int std_select_cpu(struct task_struct *p, int cpu)
 		return cpu;
 
 	/*
-	 * Core-scheduled tasks must stay together. Peek at the
-	 * destination runqueue: select_task_rq runs with the task
-	 * pi_lock held, so this is a benign racy read that only ever
-	 * skips steering.
+	 * Core check is rq-wide and may over-skip: tasks on a core-scheduled
+	 * runqueue must stay together. Peek at the destination runqueue:
+	 * select_task_rq runs with the task pi_lock held, so this is a
+	 * benign racy read that only ever skips steering.
 	 */
 	if (sched_core_enabled(cpu_rq(cpu)))
 		return cpu;

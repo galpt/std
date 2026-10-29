@@ -172,8 +172,9 @@ fi
 
 # Confinement: canonicalize dirs and refuse root, empty, same or nested dirs.
 # realpath -m (missing-ok) is intentional: it supports mocked --boot-dir paths
-# that may not exist yet. Safety comes from the refuse-root/same/nested guards
-# below, not from existence checks, so -m does not weaken confinement.
+# that may not exist yet. Canonicalizes symlinks before same/nested checks.
+# Safety comes from the refuse-root/same/nested guards below, not from
+# existence checks, so -m does not weaken confinement.
 if command -v realpath >/dev/null 2>&1; then
 	KERNEL_DIR="$(realpath -m -- "${KERNEL_DIR}")"
 	BOOT_DIR="$(realpath -m -- "${BOOT_DIR}")"
@@ -211,9 +212,9 @@ else
 	unset LOCALVERSION || true
 fi
 
-# Allowlisted release/token check: ^[A-Za-z0-9._+-]+$ (no slash, no glob, no empty).
+# Allowlisted release/token check: ^[A-Za-z0-9._][A-Za-z0-9._+-]*$ (no slash, no glob, no empty, no leading dash).
 is_safe_ver() {
-	printf '%s' "${1:-}" | grep -Eq '^[A-Za-z0-9._+-]+$'
+	printf '%s' "${1:-}" | grep -Eq '^[A-Za-z0-9._][A-Za-z0-9._+-]*$'
 }
 
 # Log all output to /tmp/std-install-*.log while keeping stdout.
@@ -228,6 +229,7 @@ echo "Boot: ${BOOT_DIR}"
 # ---- Slice 1: privilege probe, dependency check, NVIDIA detection ----
 # All helpers are read-only unless explicitly installing with sudo -n.
 # sudo stays fail-closed: only `sudo -n` is ever used, never bare sudo.
+# PATH: privileged exec resolves via sudo secure_path; never export PATH.
 HAVE_SUDO=0
 HAVE_NVIDIA_HW=0
 NVIDIA_MOD_LOADED=0
@@ -301,7 +303,7 @@ check_deps() {
 			return 1
 		fi
 		if [ "${HAVE_SUDO}" -ne 1 ]; then
-			echo "Cannot install deps without sudo -n; install manually (Arch-first): sudo pacman -S --needed ${missing_pkgs}" >&2
+			echo "Cannot install deps without sudo -n; install manually (Arch-first): sudo -n pacman -S --needed ${missing_pkgs}" >&2
 			return 0
 		fi
 		# Arch-first distro map: translate the Arch pkg list per manager.
@@ -362,7 +364,7 @@ check_deps() {
 		echo "No supported package manager found (pacman/apt-get/dnf/zypper); install manually: ${missing_pkgs} (Debian: ${distro_pkgs})" >&2
 		return 0
 	fi
-	echo "Continuing without them; rerun with --yes --install-deps to auto-install (Arch-first: pacman, apt-get, dnf, zypper), or: sudo pacman -S --needed ${missing_pkgs}" >&2
+	echo "Continuing without them; rerun with --yes --install-deps to auto-install (Arch-first: pacman, apt-get, dnf, zypper), or: sudo -n pacman -S --needed ${missing_pkgs}" >&2
 	return 0
 }
 
@@ -886,6 +888,17 @@ inherit_modeset() {
 	fi
 }
 
+# Re-validate inherited modeset opts against the allowlist (fail-closed;
+# /proc/cmdline is external input; grep pre-filter is not a guarantee).
+validate_modeset_opts() {
+	for tok in ${MODESET_OPTS:-}; do
+		case "${tok}" in
+			nvidia-drm.modeset=0|nvidia-drm.modeset=1|nvidia_drm.modeset=0|nvidia_drm.modeset=1|nvidia.NVreg_PreserveVideoMemoryAllocations=0|nvidia.NVreg_PreserveVideoMemoryAllocations=1|nvidia_drm.fbdev=0|nvidia_drm.fbdev=1) ;;
+			*) echo "refusing unsafe modeset token: ${tok}" >&2; return 1 ;;
+		esac
+	done
+}
+
 # Audit modprobe.d for NVIDIA modeset persistence (read-only; never mutates).
 # Checks /etc/modprobe.d, /lib/modprobe.d, /usr/lib/modprobe.d for
 # nvidia-drm modeset tokens. Direct read first, sudo -n fallback.
@@ -1237,7 +1250,7 @@ Hard signatures (fail-closed): missing btrfs/overlay modules
 only when lone + healthy): "_addedmodules[]: bad array subscript".
 Also fail on <50M image, missing initrd, or <1000 modules.
 Do NOT boot the degraded image. Rebuild manually, e.g.:
-  sudo mkinitcpio -k ${target_ver} -g /boot/initramfs-${target_ver}.img
+  sudo -n mkinitcpio -k ${target_ver} -g /boot/initramfs-${target_ver}.img
 or rerun kernel-install for ${target_ver}, then re-check sizes before reboot.
 EOF
 	# Root-cause hint for the mkinitcpio bad-array signature (no auto-fix).
@@ -1314,9 +1327,9 @@ update_limine() {
 WARNING: STD kernel ${target_ver} not listed in ${LIMINE_CONF} (no sudo -n; fail-closed).
 kernel-install creates a BLS entry, but Limine boots from limine.conf.
 Sync manually, e.g.:
-  sudo limine-entry-tool --add-kernel std <vmlinuz-${target_ver}> <initramfs-${target_ver}>
-  sudo limine-entry-tool --tree
-  (or: sudo limine-update)
+  sudo -n limine-entry-tool --add-kernel std <vmlinuz-${target_ver}> <initramfs-${target_ver}>
+  sudo -n limine-entry-tool --tree
+  (or: sudo -n limine-update)
 ${modeset_hint}
 See README Verify for details. Do NOT reboot without a Limine entry.
 EOF
@@ -1336,6 +1349,10 @@ EOF
 		fi
 	fi
 	inherit_modeset
+	if [ -n "${MODESET_OPTS:-}" ] && ! validate_modeset_opts; then
+		echo "WARNING: unsafe modeset opts refused; omitting CMDLINE modeset." >&2
+		MODESET_OPTS=""
+	fi
 	if [ -n "${MODESET_OPTS:-}" ]; then
 		echo "Wiring modeset opts into Limine verify: ${MODESET_OPTS}"
 	fi
@@ -1389,9 +1406,9 @@ WARNING: STD kernel ${target_ver} not listed in ${LIMINE_CONF}.
 kernel-install creates a BLS entry, but Limine boots from limine.conf.
 No limine-entry-tool/limine-update found; trying filtered fallback below.
 Manual sync e.g.:
-  sudo limine-entry-tool --add-kernel std <vmlinuz-${target_ver}> <initramfs-${target_ver}>
-  sudo limine-entry-tool --tree
-  (or: sudo limine-update)
+  sudo -n limine-entry-tool --add-kernel std <vmlinuz-${target_ver}> <initramfs-${target_ver}>
+  sudo -n limine-entry-tool --tree
+  (or: sudo -n limine-update)
 ${modeset_hint}
 EOF
 	fi
@@ -1410,7 +1427,7 @@ EOF
 			return 0
 		fi
 	else
-		# shellcheck disable=SC2024 # sudo applies to cat (root read); redirect targets user-owned tmpfile by design
+		# shellcheck disable=SC2024 # sudo -n applies to cat (root read); redirect targets user-owned tmpfile by design
 		if ! sudo -n cat -- "${LIMINE_CONF}" >"${tmpfile}" 2>/dev/null; then
 			echo "WARNING: cannot read ${LIMINE_CONF} via sudo -n; rolling back ${backup}." >&2
 			sudo -n cp -a -- "${backup}" "${LIMINE_CONF}" || true
@@ -1585,6 +1602,10 @@ write_bls_entry() {
 	if [ -z "${MODESET_OPTS:-}" ]; then
 		inherit_modeset || true
 	fi
+	if [ -n "${MODESET_OPTS:-}" ] && ! validate_modeset_opts; then
+		echo "write_bls_entry: refusing unsafe modeset opts: ${MODESET_OPTS}" >&2
+		return 1
+	fi
 	if [ "${HAVE_SUDO}" -ne 1 ]; then
 		echo "WARNING: no sudo -n; cannot write BLS entry ${BLS_FILE} (fail-closed)." >&2
 		return 0
@@ -1634,6 +1655,10 @@ verify_modeset_wired() {
 	fi
 	if ! is_safe_ver "${target_ver}"; then
 		echo "verify_modeset_wired: refusing unsafe target version: ${target_ver}" >&2
+		return 1
+	fi
+	if ! validate_modeset_opts; then
+		echo "verify_modeset_wired: refusing unsafe modeset opts: ${MODESET_OPTS}" >&2
 		return 1
 	fi
 	first_tok="$(printf '%s' "${MODESET_OPTS}" | awk '{print $1}')"
@@ -2104,6 +2129,12 @@ elif [ "${FRESH}" -eq 1 ]; then
 			fi
 		fi
 		echo "Removing existing tree for --fresh re-clone: ${KERNEL_DIR}..."
+		# Ownership guard: sudo builds leave KDIR root-owned; bare rm -rf
+		# as non-root would fail partway. Fail closed with hint.
+		if [ ! -w "${KERNEL_DIR}" ]; then
+			echo "Refusing --fresh: ${KERNEL_DIR} is not writable (root-owned after sudo builds); fix ownership first, e.g.: sudo -n chown -R \"$(id -un):$(id -gn)\" -- \"${KERNEL_DIR}\" (or sudo -n rm -rf -- \"${KERNEL_DIR}\" manually), then rerun." >&2
+			exit 1
+		fi
 		rm -rf -- "${KERNEL_DIR}"
 		echo "Cloning fresh v7.3 to ${KERNEL_DIR} (--fresh)..."
 		reject_v74
@@ -2162,9 +2193,19 @@ while IFS= read -r patch; do
 	fi
 	CHECKPATCH="${KERNEL_DIR}/scripts/checkpatch.pl"
 	if [ -f "${CHECKPATCH}" ] && command -v perl >/dev/null 2>&1; then
-		if ! perl "${CHECKPATCH}" --strict --no-tree "${PATCH_FILE}" >/dev/null 2>&1; then
+		# stdin (- < file) avoids git_is_single_file file-mode: a tracked
+		# patch passed as argv would diff -u /dev/null and flag patch
+		# formatting as errors. --ignore FILE_PATH_CHANGES scoped to 0003 only
+		# (0003 adds kernel/sched/std.c/std.h by design; MAINTAINERS update N/A).
+		CHECKPATCH_IGNORE=""
+		case "${patch}" in
+			0003-*) CHECKPATCH_IGNORE="--ignore FILE_PATH_CHANGES" ;;
+		esac
+		# shellcheck disable=SC2086 # CHECKPATCH_IGNORE is empty or one allowlisted flag.
+		if ! perl "${CHECKPATCH}" --strict --no-tree ${CHECKPATCH_IGNORE} - < "${PATCH_FILE}" >/dev/null 2>&1; then
 			echo "checkpatch --strict failed for ${patch}" >&2
-			perl "${CHECKPATCH}" --strict --no-tree "${PATCH_FILE}" 2>&1 | head -n 20 >&2 || true
+			# shellcheck disable=SC2086 # See above.
+			perl "${CHECKPATCH}" --strict --no-tree ${CHECKPATCH_IGNORE} - < "${PATCH_FILE}" 2>&1 | head -n 20 >&2 || true
 			FAILED=1
 		fi
 	else
@@ -2318,7 +2359,7 @@ if [ "${INHERITED_CONFIG}" -eq 0 ] && [ -n "${RUNNING_REL:-}" ]; then
 			if [ "${INHERITED_CONFIG}" -eq 0 ]; then
 				if [ "${HAVE_SUDO:-0}" -eq 1 ] && sudo -n test -f "${BOOT_CONFIG}" 2>/dev/null; then
 					echo "Inheriting config from ${BOOT_CONFIG} via sudo -n cat (root-only)..."
-					# shellcheck disable=SC2024 # sudo applies to cat (root read); redirect targets tree-owned .config by design
+					# shellcheck disable=SC2024 # sudo -n applies to cat (root read); redirect targets tree-owned .config by design
 					if sudo -n cat -- "${BOOT_CONFIG}" >"${KERNEL_DIR}/.config" 2>/dev/null; then
 						CONFIG_SOURCE="${BOOT_CONFIG} (sudo -n cat)"
 						INHERITED_CONFIG=1

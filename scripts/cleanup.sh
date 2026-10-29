@@ -77,6 +77,7 @@ fi
 # Confinement: canonicalize and refuse root or empty.
 # realpath -m (missing-ok) is intentional for consistency with install/uninstall;
 # safety comes from the refuse-root guard, not from existence checks.
+# Canonicalizes symlinks before the refuse-root check.
 if command -v realpath >/dev/null 2>&1; then
 	KERNEL_DIR="$(realpath -m -- "${KERNEL_DIR}")"
 else
