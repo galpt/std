@@ -1,12 +1,12 @@
-From 79349d6797662fbd04e033c568cb24004557905b Mon Sep 17 00:00:00 2001
+From 79349d6797662fbd04e033c568cb24004557905 Mon Sep 17 00:00:00 2001
 From: Galih Tama <galpt@v.recipes>
 Date: Thu, 29 Oct 2026 01:49:42 +0700
 Subject: [PATCH 2/4] STD: wire build and sched.h include
 
 Wire std.o behind CONFIG_SMART_TASK_DISTRIBUTOR and include
 std.h from sched.h. Keeps build parallel and keeps routing above
-deadline with no new scheduling class; steering remains a
-best-effort soft hint.
+deadline with no new scheduling class; steering uses deficit
+enforcement.
 
 Signed-off-by: Galih Tama <galpt@v.recipes>
 ---
@@ -37,4 +37,3 @@ index 4c25fbe84..21266bc32 100644
  #define TASK_ON_RQ_QUEUED	1
 -- 
 2.56.0
-

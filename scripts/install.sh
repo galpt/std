@@ -175,6 +175,12 @@ fi
 # that may not exist yet. Canonicalizes symlinks before same/nested checks.
 # Safety comes from the refuse-root/same/nested guards below, not from
 # existence checks, so -m does not weaken confinement.
+# Refuse empty/root BOOT_DIR before canonicalization (realpath -m would map
+# "" to PWD and hide an empty --boot-dir), then canonicalize and refuse again.
+# Mirrors scripts/verify-std.sh: install and verify share one rule.
+case "${BOOT_DIR}" in
+	""|"/"|"//") echo "Refusing unsafe BOOT_DIR: ${BOOT_DIR}" >&2; exit 1 ;;
+esac
 if command -v realpath >/dev/null 2>&1; then
 	KERNEL_DIR="$(realpath -m -- "${KERNEL_DIR}")"
 	BOOT_DIR="$(realpath -m -- "${BOOT_DIR}")"
@@ -183,10 +189,10 @@ else
 	BOOT_DIR="$(readlink -f -- "${BOOT_DIR}" 2>/dev/null || printf '%s' "${BOOT_DIR}")"
 fi
 case "${KERNEL_DIR}" in
-	""|"/") echo "Refusing unsafe KERNEL_DIR: ${KERNEL_DIR}" >&2; exit 1 ;;
+	""|"/"|"//") echo "Refusing unsafe KERNEL_DIR: ${KERNEL_DIR}" >&2; exit 1 ;;
 esac
 case "${BOOT_DIR}" in
-	""|"/") echo "Refusing unsafe BOOT_DIR: ${BOOT_DIR}" >&2; exit 1 ;;
+	""|"/"|"//") echo "Refusing unsafe BOOT_DIR: ${BOOT_DIR}" >&2; exit 1 ;;
 esac
 if [ "${KERNEL_DIR}" = "${BOOT_DIR}" ]; then
 	echo "KERNEL_DIR and BOOT_DIR must differ" >&2
@@ -212,9 +218,25 @@ else
 	unset LOCALVERSION || true
 fi
 
-# Allowlisted release/token check: ^[A-Za-z0-9._][A-Za-z0-9._+-]*$ (no slash, no glob, no empty, no leading dash).
+# Allowlisted release/token check: ^[A-Za-z0-9_][A-Za-z0-9._+-]*$ (no slash, no glob, no empty, no leading dash/dot; explicit dot-only guard rejects "." and ".." directory traversal).
+# Newline/tab/space/control pre-reject before grep: grep -E ^...$ matches per line,
+# so an embedded newline ("ok\nbad") would otherwise pass on the first line.
+# The shell case below fails closed on any char outside the allowlist (covers
+# space, tab, newline and controls) plus a leading-class check, then grep
+# re-validates the full token as defense in depth.
+# Mirrors scripts/verify-std.sh: install and verify share one rule.
 is_safe_ver() {
-	printf '%s' "${1:-}" | grep -Eq '^[A-Za-z0-9._][A-Za-z0-9._+-]*$'
+	case "${1:-}" in
+		"."|"..") return 1 ;;
+	esac
+	case "${1:-}" in
+		*[!A-Za-z0-9._+-]*) return 1 ;;
+	esac
+	case "${1:-}" in
+		[A-Za-z0-9_]* ) ;;
+		*) return 1 ;;
+	esac
+	printf '%s' "${1:-}" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._+-]*$'
 }
 
 # Log all output to /tmp/std-install-*.log while keeping stdout.
@@ -613,7 +635,7 @@ dkms_pre() {
 		echo "dkms_pre: no sudo -n, skipping stale DKMS cleanup (fail-closed)." >&2
 		return 0
 	fi
-	stale="$(dkms status 2>/dev/null | grep -F -- "${target_ver}" | grep -i "nvidia" || true)"
+	stale="$(dkms status 2>/dev/null | grep -F -- "${target_ver}" | grep -F -i -- "nvidia" || true)"
 	if [ -z "${stale}" ]; then
 		echo "dkms_pre: no stale NVIDIA entries for ${target_ver}."
 		return 0
@@ -899,6 +921,361 @@ validate_modeset_opts() {
 	done
 }
 
+# STD CPU isolation helpers: cpulist validation + SMT-aware derivation.
+# Valid cpulist: 8-15, 0,2,4-7, etc. Format check only (no bounds here).
+# Newline/tab/space/control pre-reject before grep: grep -E ^...$ matches
+# per line, so an embedded newline ("8-15\nbad") would otherwise pass.
+# The shell case fails closed on any char outside [0-9,-] (covers space,
+# tab, newline and controls), then grep re-validates the full cpulist.
+is_valid_cpulist() {
+	valid_list="${1:-}"
+	if [ -z "${valid_list}" ]; then
+		return 1
+	fi
+	case "${valid_list}" in
+		*[!0-9,-]*) return 1 ;;
+	esac
+	if ! printf '%s' "${valid_list}" | grep -Eq '^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$'; then
+		return 1
+	fi
+	return 0
+}
+
+# Expand a cpulist (e.g. 0-1,8) to one CPU id per line. Returns 1 on bad input.
+iso_expand_one() {
+	iso_part="${1:-}"
+	case "${iso_part}" in
+		*-*)
+			iso_s="${iso_part%%-*}"
+			iso_e="${iso_part##*-}"
+			case "${iso_s}${iso_e}" in
+				''|*[!0-9]*) return 1 ;;
+			esac
+			if [ "${iso_s}" -gt "${iso_e}" ]; then
+				return 1
+			fi
+			iso_i="${iso_s}"
+			while [ "${iso_i}" -le "${iso_e}" ]; do
+				printf '%s\n' "${iso_i}"
+				iso_i=$(( iso_i + 1 ))
+			done
+			;;
+		*)
+			case "${iso_part}" in
+				''|*[!0-9]*) return 1 ;;
+			esac
+			printf '%s\n' "${iso_part}"
+			;;
+	esac
+}
+
+iso_expand_cpulist() {
+	iso_in_list="${1:-}"
+	iso_sp="$(printf '%s' "${iso_in_list}" | tr ',' ' ')"
+	# shellcheck disable=SC2086 # word-splitting on space-converted commas is intentional
+	for iso_p in ${iso_sp}; do
+		if ! iso_expand_one "${iso_p}"; then
+			return 1
+		fi
+	done
+}
+
+# STD CPU isolation range: whole SMT cores from the top until >= N/2.
+# Enumerates thread_siblings_list under the topology dir, dedupes core
+# groups, sorts by min-id, accumulates whole cores from the top (largest
+# min-id first) until the CPU sum reaches ceil(N/2), emits a compressed
+# cpulist (8-15 when contiguous, else comma list e.g. 2-3,6-7).
+# Falls back to legacy N/2..N-1 with a stderr warning when topology is
+# missing/unreadable. N from $1 (numeric) else nproc/getconf; topology
+# dir from $2 else ${STD_TOPOLOGY_DIR:-/sys/devices/system/cpu}. A single
+# $1 containing '/' is treated as the topology dir with N derived (topo
+# count when available, else nproc). Regex + bounds validated.
+# Out-of-range sibling IDs (>= N) are skipped (ignored) during group
+# accumulation, not a failure; a final compressed range containing an
+# out-of-range CPU fails the SMT path and falls back to legacy N/2..N-1.
+derive_isolation_range() {
+	iso_arg1="${1:-}"
+	iso_arg2="${2:-}"
+	iso_ncpus=""
+	iso_topo=""
+	if [ $# -ge 2 ]; then
+		iso_ncpus="${iso_arg1}"
+		iso_topo="${iso_arg2}"
+	elif [ $# -eq 1 ]; then
+		case "${iso_arg1}" in
+			*/*)
+				iso_topo="${iso_arg1}"
+				;;
+			*)
+				iso_ncpus="${iso_arg1}"
+				;;
+		esac
+	fi
+	if [ -z "${iso_topo}" ]; then
+		iso_topo="${STD_TOPOLOGY_DIR:-/sys/devices/system/cpu}"
+	fi
+	if [ -z "${iso_ncpus}" ]; then
+		iso_count=0
+		if [ -d "${iso_topo}" ]; then
+			for iso_d in "${iso_topo}"/cpu[0-9]*; do
+				[ -d "${iso_d}" ] || continue
+				iso_count=$(( iso_count + 1 ))
+			done
+		fi
+		if [ "${iso_count}" -ge 2 ]; then
+			iso_ncpus="${iso_count}"
+		else
+			if command -v nproc >/dev/null 2>&1; then
+				iso_ncpus="$(nproc 2>/dev/null || true)"
+			fi
+			if [ -z "${iso_ncpus}" ] && command -v getconf >/dev/null 2>&1; then
+				iso_ncpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+			fi
+		fi
+	fi
+	iso_ncpus="$(printf '%s' "${iso_ncpus}" | tr -d '[:space:]' 2>/dev/null || printf '%s' "${iso_ncpus}")"
+	if ! printf '%s' "${iso_ncpus}" | grep -Eq '^[0-9]+$'; then
+		echo "derive_isolation_range: invalid CPU count: ${iso_ncpus}" >&2
+		return 1
+	fi
+	if [ "${iso_ncpus}" -lt 2 ]; then
+		echo "derive_isolation_range: CPU count ${iso_ncpus} too small for isolation" >&2
+		return 1
+	fi
+	iso_legacy_start=$(( iso_ncpus / 2 ))
+	iso_legacy_end=$(( iso_ncpus - 1 ))
+	iso_legacy="${iso_legacy_start}-${iso_legacy_end}"
+	iso_smt_ok=1
+	if [ -z "${iso_topo}" ] || [ ! -d "${iso_topo}" ]; then
+		iso_smt_ok=0
+	else
+		iso_i=0
+		while [ "${iso_i}" -lt "${iso_ncpus}" ]; do
+			if [ ! -r "${iso_topo}/cpu${iso_i}/topology/thread_siblings_list" ]; then
+				iso_smt_ok=0
+				break
+			fi
+			iso_i=$(( iso_i + 1 ))
+		done
+	fi
+	if [ "${iso_smt_ok}" -eq 1 ]; then
+		iso_tmp="$(mktemp /tmp/std-iso-XXXXXX 2>/dev/null || true)"
+		if [ -z "${iso_tmp}" ]; then
+			iso_smt_ok=0
+		else
+			iso_uniq="${iso_tmp}.uniq"
+			iso_groups="${iso_tmp}.groups"
+			iso_sel="${iso_tmp}.sel"
+			: >"${iso_tmp}" 2>/dev/null || iso_smt_ok=0
+			: >"${iso_uniq}" 2>/dev/null || iso_smt_ok=0
+			: >"${iso_groups}" 2>/dev/null || iso_smt_ok=0
+			: >"${iso_sel}" 2>/dev/null || iso_smt_ok=0
+		fi
+	fi
+	if [ "${iso_smt_ok}" -eq 1 ]; then
+		iso_i=0
+		while [ "${iso_i}" -lt "${iso_ncpus}" ]; do
+			iso_file="${iso_topo}/cpu${iso_i}/topology/thread_siblings_list"
+			iso_raw="$(cat -- "${iso_file}" 2>/dev/null | tr -d '[:space:]' || true)"
+			if [ -z "${iso_raw}" ]; then
+				iso_smt_ok=0
+				break
+			fi
+			if ! is_valid_cpulist "${iso_raw}"; then
+				iso_smt_ok=0
+				break
+			fi
+			printf '%s\n' "${iso_raw}" >>"${iso_tmp}" 2>/dev/null || { iso_smt_ok=0; break; }
+			iso_i=$(( iso_i + 1 ))
+		done
+	fi
+	if [ "${iso_smt_ok}" -eq 1 ]; then
+		if ! sort -u -- "${iso_tmp}" >"${iso_uniq}" 2>/dev/null; then
+			iso_smt_ok=0
+		elif [ ! -s "${iso_uniq}" ]; then
+			iso_smt_ok=0
+		fi
+	fi
+	if [ "${iso_smt_ok}" -eq 1 ]; then
+		while IFS= read -r iso_grp || [ -n "${iso_grp}" ]; do
+			[ -z "${iso_grp}" ] && continue
+			iso_ids="$(iso_expand_cpulist "${iso_grp}" 2>/dev/null | sort -n -u || true)"
+			if [ -z "${iso_ids}" ]; then
+				iso_smt_ok=0
+				break
+			fi
+			iso_min=""
+			iso_cnt=0
+			while IFS= read -r iso_c || [ -n "${iso_c}" ]; do
+				[ -z "${iso_c}" ] && continue
+				case "${iso_c}" in
+					''|*[!0-9]*) iso_smt_ok=0; break 2 ;;
+				esac
+				# Out-of-range skip (not fail): sibling IDs >= N are ignored
+				# here; a final range containing one fails the SMT path below
+				# and falls back to legacy.
+				if [ "${iso_c}" -ge "${iso_ncpus}" ]; then
+					continue
+				fi
+				if [ -z "${iso_min}" ] || [ "${iso_c}" -lt "${iso_min}" ]; then
+					iso_min="${iso_c}"
+				fi
+				iso_cnt=$(( iso_cnt + 1 ))
+			done <<<"${iso_ids}"
+			if [ "${iso_smt_ok}" -eq 0 ]; then
+				break
+			fi
+			if [ -z "${iso_min}" ] || [ "${iso_cnt}" -eq 0 ]; then
+				continue
+			fi
+			printf '%s %s %s\n' "${iso_min}" "${iso_cnt}" "${iso_grp}" >>"${iso_groups}" 2>/dev/null || { iso_smt_ok=0; break; }
+		done <"${iso_uniq}"
+		if [ ! -s "${iso_groups}" ]; then
+			iso_smt_ok=0
+		fi
+	fi
+	iso_range=""
+	if [ "${iso_smt_ok}" -eq 1 ]; then
+		iso_need=$(( (iso_ncpus + 1) / 2 ))
+		iso_sum=0
+		: >"${iso_sel}" 2>/dev/null || iso_smt_ok=0
+		if [ "${iso_smt_ok}" -eq 1 ]; then
+			if ! sort -nr -- "${iso_groups}" >"${iso_groups}.sorted" 2>/dev/null; then
+				iso_smt_ok=0
+			else
+				mv -- "${iso_groups}.sorted" "${iso_groups}" 2>/dev/null || iso_smt_ok=0
+			fi
+		fi
+		if [ "${iso_smt_ok}" -eq 1 ]; then
+			while IFS= read -r iso_line || [ -n "${iso_line}" ]; do
+				[ -z "${iso_line}" ] && continue
+				# shellcheck disable=SC2086 # word-splitting of "min size group" is intentional
+				set -- ${iso_line}
+				iso_gmin="$1"
+				iso_gsz="$2"
+				iso_ggrp="$3"
+				if [ -z "${iso_gmin}" ] || [ -z "${iso_gsz}" ] || [ -z "${iso_ggrp}" ]; then
+					iso_smt_ok=0
+					break
+				fi
+				printf '%s\n' "${iso_ggrp}" >>"${iso_sel}" 2>/dev/null || { iso_smt_ok=0; break; }
+				iso_sum=$(( iso_sum + iso_gsz ))
+				if [ "${iso_sum}" -ge "${iso_need}" ]; then
+					break
+				fi
+			done <"${iso_groups}"
+		fi
+		if [ "${iso_smt_ok}" -eq 1 ]; then
+			iso_all_ids=""
+			while IFS= read -r iso_sg || [ -n "${iso_sg}" ]; do
+				[ -z "${iso_sg}" ] && continue
+				iso_e="$(iso_expand_cpulist "${iso_sg}" 2>/dev/null || true)"
+				if [ -z "${iso_e}" ]; then
+					iso_smt_ok=0
+					break
+				fi
+				iso_all_ids="${iso_all_ids:+${iso_all_ids}
+}${iso_e}"
+			done <"${iso_sel}"
+		fi
+		if [ "${iso_smt_ok}" -eq 1 ]; then
+			iso_final_sorted="$(printf '%s\n' "${iso_all_ids}" | sort -n -u 2>/dev/null | awk -v n="${iso_ncpus}" '$1 < n' || true)"
+			if [ -z "${iso_final_sorted}" ]; then
+				iso_smt_ok=0
+			else
+				iso_range="$(printf '%s\n' "${iso_final_sorted}" | awk 'NR==1{ s=$1; p=$1; next } { if($1==p+1){ p=$1 } else { if(s==p) printf "%s%s", sep, s; else printf "%s%s-%s", sep, s, p; sep=","; s=$1; p=$1 } } END{ if(s!=""){ if(s==p) printf "%s%s", sep, s; else printf "%s%s-%s", sep, s, p } }' 2>/dev/null || true)"
+				if [ -z "${iso_range}" ]; then
+					iso_smt_ok=0
+				elif ! is_valid_cpulist "${iso_range}"; then
+					iso_smt_ok=0
+				else
+					iso_chk="$(iso_expand_cpulist "${iso_range}" 2>/dev/null || true)"
+					iso_bad=0
+					while IFS= read -r iso_c || [ -n "${iso_c}" ]; do
+						[ -z "${iso_c}" ] && continue
+						if [ "${iso_c}" -ge "${iso_ncpus}" ]; then
+							iso_bad=1
+							break
+						fi
+					done <<<"${iso_chk}"
+					if [ "${iso_bad}" -ne 0 ]; then
+						iso_smt_ok=0
+					fi
+				fi
+			fi
+		fi
+		rm -f -- "${iso_tmp}" "${iso_uniq}" "${iso_groups}" "${iso_sel}" 2>/dev/null || true
+	fi
+	if [ "${iso_smt_ok}" -eq 1 ] && [ -n "${iso_range}" ]; then
+		printf '%s' "${iso_range}"
+		return 0
+	fi
+	rm -f -- "${iso_tmp:-}" "${iso_tmp:-}.uniq" "${iso_tmp:-}.groups" "${iso_tmp:-}.sel" 2>/dev/null || true
+	echo "derive_isolation_range: SMT topology unavailable, falling back to legacy ${iso_legacy}" >&2
+	if ! is_valid_cpulist "${iso_legacy}"; then
+		echo "derive_isolation_range: invalid legacy range: ${iso_legacy}" >&2
+		return 1
+	fi
+	printf '%s' "${iso_legacy}"
+}
+
+# Normalize cmdline isolation tokens: strip all isolcpus=/nohz_full=/rcu_nocbs=
+# (any value), dedupe, append canonical three once in fixed order, idempotent.
+# Preserves order of remaining tokens (root/rootflags/MODESET untouched).
+# $1 = cmdline, $2 = cpulist (optional; derived when empty). Accepts cpulist
+# (8-15 contiguous or comma list e.g. 2-3,6-7); each range must have
+# start <= end and numeric CPUs.
+normalize_isolation_cmdline() {
+	norm_in="${1:-}"
+	norm_range="${2:-}"
+	if [ -z "${norm_range}" ]; then
+		if ! norm_range="$(derive_isolation_range)"; then
+			echo "normalize_isolation_cmdline: cannot derive isolation range" >&2
+			return 1
+		fi
+	fi
+	if ! is_valid_cpulist "${norm_range}"; then
+		echo "normalize_isolation_cmdline: refusing unsafe range: ${norm_range}" >&2
+		return 1
+	fi
+	norm_sp="$(printf '%s' "${norm_range}" | tr ',' ' ')"
+	# shellcheck disable=SC2086 # word-splitting on space-converted commas is intentional
+	for norm_part in ${norm_sp}; do
+		case "${norm_part}" in
+			*-*)
+				norm_s="${norm_part%%-*}"
+				norm_e="${norm_part##*-}"
+				case "${norm_s}${norm_e}" in
+					''|*[!0-9]*) echo "normalize_isolation_cmdline: refusing unsafe range: ${norm_range}" >&2; return 1 ;;
+				esac
+				if [ "${norm_s}" -gt "${norm_e}" ]; then
+					echo "normalize_isolation_cmdline: refusing inverted range: ${norm_range}" >&2
+					return 1
+				fi
+				;;
+			*)
+				case "${norm_part}" in
+					''|*[!0-9]*) echo "normalize_isolation_cmdline: refusing unsafe range: ${norm_range}" >&2; return 1 ;;
+				esac
+				;;
+		esac
+	done
+	norm_out=""
+	# shellcheck disable=SC2086 # word-splitting of cmdline tokens is intentional (one token per word)
+	for norm_tok in ${norm_in}; do
+		case "${norm_tok}" in
+			isolcpus=*|nohz_full=*|rcu_nocbs=*) continue ;;
+			*) norm_out="${norm_out:+${norm_out} }${norm_tok}" ;;
+		esac
+	done
+	if [ -z "${norm_out}" ]; then
+		norm_out="isolcpus=${norm_range} nohz_full=${norm_range} rcu_nocbs=${norm_range}"
+	else
+		norm_out="${norm_out} isolcpus=${norm_range} nohz_full=${norm_range} rcu_nocbs=${norm_range}"
+	fi
+	printf '%s' "${norm_out}"
+}
+
 # Audit modprobe.d for NVIDIA modeset persistence (read-only; never mutates).
 # Checks /etc/modprobe.d, /lib/modprobe.d, /usr/lib/modprobe.d for
 # nvidia-drm modeset tokens. Direct read first, sudo -n fallback.
@@ -1037,6 +1414,51 @@ boot_grep() {
 		return 0
 	fi
 	return 1
+}
+
+boot_grep_same_line() {
+	# Same-line check via pipe: line must contain BOTH pat1 and pat2 (exact ver).
+	# File-level co-occurrence in different lines does NOT satisfy Limine
+	# (title line is `/STD kernel (ver)` canonical, `:STD <ver>` legacy compat). Uses fixed strings (-F) with `--`.
+	# Exact ver: canonical requires "(ver)" with parens (prevents 7.3.0-std matching 7.3.0-std-dirty);
+	# legacy ":STD ver" requires token-boundary (ver not followed by [A-Za-z0-9._+-]).
+	# Mirrors scripts/verify-std.sh: install and verify share one rule.
+	pat1="$1"
+	pat2="$2"
+	file="$3"
+	case "${pat1}" in
+		"/STD kernel"*)
+			case "${pat2}" in
+				"("*")") exact="${pat2}" ;;
+				*) exact="(${pat2})" ;;
+			esac
+			if [ -f "${file}" ] && grep -F -- "${pat1}" "${file}" 2>/dev/null | grep -F -q -- "${exact}"; then
+				return 0
+			fi
+			if [ "${HAVE_SUDO}" -eq 1 ] && sudo -n grep -F -- "${pat1}" "${file}" 2>/dev/null | grep -F -q -- "${exact}"; then
+				return 0
+			fi
+			return 1
+			;;
+		":STD"*)
+			if [ -f "${file}" ] && awk -v ver="${pat2}" 'index($0, ":STD")>0 { p=index($0, ":STD"); rest=substr($0, p+4); sub(/^[ \t]+/, "", rest); if (substr(rest,1,length(ver))==ver) { after=substr(rest, length(ver)+1, 1); if (after=="" || after !~ /[A-Za-z0-9._+\-]/) { found=1; exit 0 } } } END { exit !found }' "${file}" 2>/dev/null; then
+				return 0
+			fi
+			if [ "${HAVE_SUDO}" -eq 1 ] && sudo -n awk -v ver="${pat2}" 'index($0, ":STD")>0 { p=index($0, ":STD"); rest=substr($0, p+4); sub(/^[ \t]+/, "", rest); if (substr(rest,1,length(ver))==ver) { after=substr(rest, length(ver)+1, 1); if (after=="" || after !~ /[A-Za-z0-9._+\-]/) { found=1; exit 0 } } } END { exit !found }' "${file}" 2>/dev/null; then
+				return 0
+			fi
+			return 1
+			;;
+		*)
+			if [ -f "${file}" ] && grep -F -- "${pat1}" "${file}" 2>/dev/null | grep -F -q -- "${pat2}"; then
+				return 0
+			fi
+			if [ "${HAVE_SUDO}" -eq 1 ] && sudo -n grep -F -- "${pat1}" "${file}" 2>/dev/null | grep -F -q -- "${pat2}"; then
+				return 0
+			fi
+			return 1
+			;;
+	esac
 }
 
 # Build the initramfs for the target kernel.
@@ -1290,13 +1712,19 @@ find_limine_conf() {
 	return 1
 }
 
-# Limine: backup conf, add-kernel + tree if tool exists, verify, rollback.
-# 4-candidate search; prefers limine-entry-tool, falls back to limine-update
-# and to a filtered append (STD block with ver + modeset opts), always with
-# backup + rollback. Wires MODESET_OPTS into the verify step.
-# Guarantee: an entry counts as present only when BOTH "STD" and the exact
-# target ver are found; a BLS entry never satisfies (or skips) Limine, so the
-# entry is created even when BLS exists. BOOT_DIR-scoped 4 candidates only.
+# Limine: standalone STD entry positioned after KPP fallback (filtered insert).
+# 4-candidate search; positioned insert of /STD kernel (ver) after
+# /Devario KPP kernel (...) (fallback) stanza end, always with backup+rollback.
+# Stanza: slash title, lowercase protocol/kernel_path/module_path/cmdline,
+# flat boot():/ paths, full cmdline (root UUID/rootflags from KPP primary
+# cmdline, fallback filtered /proc/cmdline, plus validated MODESET_OPTS),
+# No BLAKE2b comment. Dedupe before insert removes nested //std
+# (//std + kernel-id=std), legacy EOF (# STD + :STD + UPPERCASE), orphan
+# uppercase PROTOCOL:/CMDLINE: pairs, and prior /STD kernel duplicates.
+# Guarantee: canonical /STD kernel (ver) same-line; legacy :STD ver accepted
+# for compat; file-level co-occurrence alone does NOT satisfy. BLS never
+# satisfies Limine. BOOT_DIR-scoped 4 candidates only. Preserves
+# default_entry. sudo -n only. DRY_RUN/STATUS never mutate.
 update_limine() {
 	target_ver="$1"
 	if ! is_safe_ver "${target_ver}"; then
@@ -1309,12 +1737,16 @@ update_limine() {
 	fi
 	echo "Checking Limine entry in ${LIMINE_CONF} (4-candidate search under ${BOOT_DIR})..."
 	echo "Limine guarantee: BLS presence never skips Limine (Limine boots from limine.conf, not loader/entries)."
-	if boot_grep "STD" "${LIMINE_CONF}" && boot_grep "${target_ver}" "${LIMINE_CONF}"; then
-		echo "Limine entry already present (STD + ${target_ver} verified)."
-		return 0
-	fi
+	case "${LIMINE_CONF}" in
+		"${BOOT_DIR}/limine.conf"|"${BOOT_DIR}/limine/limine.conf"|"${BOOT_DIR}/EFI/BOOT/limine.conf"|"${BOOT_DIR}/boot/limine.conf")
+			;;
+		*)
+			echo "Skipping unexpected Limine path ${LIMINE_CONF}." >&2
+			return 0
+			;;
+	esac
 	if [ "${DRY_RUN}" -eq 1 ] || [ "${STATUS_MODE}" -eq 1 ]; then
-		echo "Read-only mode: would sync Limine entry for ${target_ver} via limine-entry-tool/limine-update/filtered fallback (no changes)."
+		echo "Read-only mode: would sync Limine entry for ${target_ver} via positioned filtered insert after KPP fallback (no changes)."
 		return 0
 	fi
 	if [ "${HAVE_SUDO}" -ne 1 ]; then
@@ -1326,19 +1758,147 @@ update_limine() {
 		cat <<EOF
 WARNING: STD kernel ${target_ver} not listed in ${LIMINE_CONF} (no sudo -n; fail-closed).
 kernel-install creates a BLS entry, but Limine boots from limine.conf.
-Sync manually, e.g.:
-  sudo -n limine-entry-tool --add-kernel std <vmlinuz-${target_ver}> <initramfs-${target_ver}>
-  sudo -n limine-entry-tool --tree
-  (or: sudo -n limine-update)
+Rerun with sudo -n to create the positioned /STD kernel entry after KPP fallback.
 ${modeset_hint}
-See README Verify for details. Do NOT reboot without a Limine entry.
+See reinstall runbook step 6 for positioned layout. Do NOT reboot without a Limine entry.
 EOF
 		return 0
+	fi
+	inherit_modeset
+	if [ -n "${MODESET_OPTS:-}" ] && ! validate_modeset_opts; then
+		echo "WARNING: unsafe modeset opts refused; omitting CMDLINE modeset." >&2
+		MODESET_OPTS=""
+	fi
+	if [ -n "${MODESET_OPTS:-}" ]; then
+		echo "Wiring modeset opts into Limine cmdline: ${MODESET_OPTS}"
+	fi
+	tmpfile="$(mktemp /tmp/std-limine-XXXXXX)"
+	tmpfilt="${tmpfile}.filt"
+	tmpnew="${tmpfile}.new"
+	tmpstanza="${tmpfile}.stanza"
+	tmpcmd="${tmpfile}.cmd"
+	if [ -f "${LIMINE_CONF}" ]; then
+		if ! cat -- "${LIMINE_CONF}" >"${tmpfile}" 2>/dev/null; then
+			echo "WARNING: cannot read ${LIMINE_CONF}; aborting Limine update (fail-closed)." >&2
+			rm -f -- "${tmpfile}" "${tmpfilt}" "${tmpnew}" "${tmpstanza}" "${tmpcmd}" 2>/dev/null || true
+			return 0
+		fi
+	else
+		# shellcheck disable=SC2024 # sudo applies to cat (root read); redirect is user-owned tmpfile by design
+		if ! sudo -n cat -- "${LIMINE_CONF}" >"${tmpfile}" 2>/dev/null; then
+			echo "WARNING: cannot read ${LIMINE_CONF} via sudo -n; aborting Limine update (fail-closed)." >&2
+			rm -f -- "${tmpfile}" "${tmpfilt}" "${tmpnew}" "${tmpstanza}" "${tmpcmd}" 2>/dev/null || true
+			return 0
+		fi
+	fi
+	default_pre="$(grep -E -- '^default_entry:' "${tmpfile}" 2>/dev/null || true)"
+	kpp_cmdline="$(awk '/\/Devario KPP kernel/ && /\(fallback\)/ { in_primary=0; next } /\/Devario KPP kernel/ && !/\(fallback\)/ { in_primary=1; next } /^\// { if (!/\/Devario KPP kernel/) { in_primary=0 } } in_primary && /^[[:space:]]*cmdline:/ { sub(/^[[:space:]]*cmdline:[[:space:]]*/, ""); print; exit }' "${tmpfile}" 2>/dev/null || true)"
+	if [ -z "${kpp_cmdline}" ]; then
+		if [ -f "/proc/cmdline" ]; then
+			proc_line="$(cat /proc/cmdline 2>/dev/null || true)"
+			filt_base=""
+			# shellcheck disable=SC2086 # word-splitting of /proc/cmdline tokens is intentional (one token per word)
+			for tok in ${proc_line}; do
+				case "${tok}" in
+					quiet|nowatchdog|splash|rw)
+						filt_base="${filt_base}${tok} "
+						;;
+					root=*|rootflags=*)
+						filt_base="${filt_base}${tok} "
+						;;
+				esac
+			done
+			kpp_cmdline="$(printf '%s' "${filt_base}" | sed 's/ *$//')"
+		fi
+	fi
+	std_cmdline="${kpp_cmdline}"
+	if [ -n "${MODESET_OPTS:-}" ]; then
+		# shellcheck disable=SC2086 # word-splitting of validated MODESET_OPTS is intentional (one token per word)
+		for tok in ${MODESET_OPTS}; do
+			case " ${std_cmdline} " in
+				*" ${tok} "*) ;;
+				*) std_cmdline="${std_cmdline:+${std_cmdline} }${tok}" ;;
+			esac
+		done
+	fi
+	if [ -z "${std_cmdline}" ]; then
+		if [ -n "${MODESET_OPTS:-}" ]; then
+			std_cmdline="${MODESET_OPTS}"
+		else
+			std_cmdline="quiet splash rw"
+		fi
+	fi
+	# STD isolation: normalize (strip any value, dedupe, append canonical three
+	# fixed order, idempotent). Preserves root/rootflags/MODESET order.
+	# Wired after MODESET_OPTS wiring, before tmpcmd write.
+	if isol_range="$(derive_isolation_range)"; then
+		if ! std_cmdline="$(normalize_isolation_cmdline "${std_cmdline}" "${isol_range}")"; then
+			echo "WARNING: isolation normalize failed; keeping cmdline without canonical isolation." >&2
+		else
+			echo "Wiring isolation into Limine cmdline: isolcpus=${isol_range} nohz_full=${isol_range} rcu_nocbs=${isol_range}"
+		fi
+	else
+		echo "WARNING: cannot derive isolation range; keeping cmdline without isolation." >&2
+		isol_range=""
+	fi
+	printf '%s' "${std_cmdline}" >"${tmpcmd}" 2>/dev/null || true
+	std_cmdline="$(cat -- "${tmpcmd}" 2>/dev/null || true)"
+	# Isolation-aware idempotency: existing STD cmdline must already equal its
+	# normalized form (catches wrong range, duplicates, missing tokens).
+	need_isol_rewrite=0
+	if [ -n "${isol_range:-}" ]; then
+		std_existing_isol="$(awk -v ver="${target_ver}" 'index($0, "/STD kernel (" ver ")")>0 { in_std=1; next } /^\// { if (in_std) in_std=0 } in_std && /^[[:space:]]*cmdline:/ { sub(/^[[:space:]]*cmdline:[[:space:]]*/, ""); print; exit }' "${tmpfile}" 2>/dev/null || true)"
+		if [ -n "${std_existing_isol}" ]; then
+			if std_norm_check="$(normalize_isolation_cmdline "${std_existing_isol}" "${isol_range}" 2>/dev/null)"; then
+				if [ "${std_existing_isol}" != "${std_norm_check}" ]; then
+					need_isol_rewrite=1
+					echo "Limine STD entry isolation mismatch (wrong/missing/duplicate); will rewrite with ${isol_range}."
+				fi
+			fi
+		fi
+	fi
+	canon_count="$(grep -F -- "/STD kernel (${target_ver})" "${tmpfile}" 2>/dev/null | grep -F -c -- "(${target_ver})" || true)"
+	case "${canon_count}" in ''|*[!0-9]*) canon_count=0 ;; esac
+	has_nested=0
+	if grep -F -q -- "//std" "${tmpfile}" 2>/dev/null || grep -F -q -- "kernel-id=std" "${tmpfile}" 2>/dev/null; then
+		has_nested=1
+	fi
+	has_legacy=0
+	if grep -F -q -- "# STD" "${tmpfile}" 2>/dev/null || grep -F -q -- ":STD" "${tmpfile}" 2>/dev/null; then
+		has_legacy=1
+	fi
+	has_upper=0
+	if grep -Eq -- '^[[:space:]]*(PROTOCOL|KERNEL_PATH|MODULE_PATH|CMDLINE):' "${tmpfile}" 2>/dev/null; then
+		has_upper=1
+	fi
+	if [ "${canon_count}" -eq 1 ] && [ "${has_nested}" -eq 0 ] && [ "${has_legacy}" -eq 0 ] && [ "${has_upper}" -eq 0 ] && [ "${need_isol_rewrite:-0}" -eq 0 ]; then
+		kpp_check="$(grep -n -F -- "/Devario KPP kernel" "${tmpfile}" 2>/dev/null | grep -F -- "(fallback)" | cut -d: -f1 | head -n 1 || true)"
+		if [ -z "${kpp_check}" ]; then
+			echo "Limine entry already present (/STD kernel ${target_ver} positioned, no remnants)."
+			rm -f -- "${tmpfile}" "${tmpfilt}" "${tmpnew}" "${tmpstanza}" "${tmpcmd}" 2>/dev/null || true
+			return 0
+		fi
+		canon_line="$(grep -n -F -- "/STD kernel (${target_ver})" "${tmpfile}" 2>/dev/null | cut -d: -f1 | head -n 1 || true)"
+		kpp_end="$(awk -v s="${kpp_check}" 'NR>s { if ($0 ~ /^$/ || $0 ~ /^\//) { print NR; exit } }' "${tmpfile}" 2>/dev/null || true)"
+		if [ -z "${kpp_end}" ]; then
+			kpp_end="$(wc -l < "${tmpfile}" 2>/dev/null | tr -d ' ' || echo 0)"
+			case "${kpp_end}" in ''|*[!0-9]*) kpp_end=0 ;; esac
+		fi
+		if [ -n "${canon_line}" ]; then
+			case "${canon_line}" in ''|*[!0-9]*) canon_line=0 ;; esac
+			case "${kpp_end}" in ''|*[!0-9]*) kpp_end=0 ;; esac
+			if [ "${canon_line}" -gt "${kpp_end}" ]; then
+				echo "Limine entry already present (/STD kernel ${target_ver} positioned after KPP fallback, no remnants)."
+				rm -f -- "${tmpfile}" "${tmpfilt}" "${tmpnew}" "${tmpstanza}" "${tmpcmd}" 2>/dev/null || true
+				return 0
+			fi
+		fi
 	fi
 	backup="${LIMINE_CONF}.std-backup-$(date +%Y%m%d%H%M%S)"
 	echo "Backing up ${LIMINE_CONF} -> ${backup}..."
 	if ! sudo -n cp -a -- "${LIMINE_CONF}" "${backup}"; then
 		echo "WARNING: Limine backup failed; aborting Limine update (fail-closed)." >&2
+		rm -f -- "${tmpfile}" "${tmpfilt}" "${tmpnew}" "${tmpstanza}" "${tmpcmd}" 2>/dev/null || true
 		return 0
 	fi
 	if command -v b2sum >/dev/null 2>&1; then
@@ -1348,135 +1908,82 @@ EOF
 			sudo -n b2sum -- "${LIMINE_CONF}" 2>/dev/null | awk '{print "Limine conf b2sum (pre, root-only): " $1}' || true
 		fi
 	fi
-	inherit_modeset
-	if [ -n "${MODESET_OPTS:-}" ] && ! validate_modeset_opts; then
-		echo "WARNING: unsafe modeset opts refused; omitting CMDLINE modeset." >&2
-		MODESET_OPTS=""
-	fi
-	if [ -n "${MODESET_OPTS:-}" ]; then
-		echo "Wiring modeset opts into Limine verify: ${MODESET_OPTS}"
-	fi
-	# Tool-driven path: limine-entry-tool add-kernel + tree (or limine-update).
-	tool_ok=0
-	if command -v limine-entry-tool >/dev/null 2>&1; then
-		echo "Updating Limine: add-kernel std + tree..."
-		if sudo -n limine-entry-tool --add-kernel std "${BOOT_DIR}/vmlinuz-${target_ver}" "${BOOT_DIR}/initramfs-${target_ver}.img" 2>&1 | tee -a "${LOG_FILE}"; then
-			if [ "${BOOT_DIR}" = "/boot" ]; then
-				if sudo -n limine-entry-tool --tree 2>&1 | tee -a "${LOG_FILE}"; then
-					:
-				else
-					echo "WARNING: limine-entry-tool --tree failed; trying limine-update..." >&2
-					if command -v limine-update >/dev/null 2>&1; then
-						sudo -n limine-update 2>&1 | tee -a "${LOG_FILE}" || echo "WARNING: limine-update failed after tree failure." >&2
-					fi
-				fi
-			else
-				echo "Skipping bootloader tree refresh for mocked BOOT_DIR ${BOOT_DIR} (would touch live /boot)."
-			fi
-			if boot_grep "STD" "${LIMINE_CONF}" && boot_grep "${target_ver}" "${LIMINE_CONF}"; then
-				echo "Limine entry verified for ${target_ver} (tool-driven, STD + ver)."
-				tool_ok=1
-			else
-				echo "WARNING: Limine tool path did not yield STD + ${target_ver}; trying filtered fallback." >&2
-			fi
-		else
-			echo "WARNING: limine-entry-tool --add-kernel failed; trying filtered fallback." >&2
-		fi
-	elif command -v limine-update >/dev/null 2>&1; then
-		echo "limine-entry-tool not found; trying limine-update refresh (no add-kernel)..."
-		if [ "${BOOT_DIR}" = "/boot" ]; then
-			sudo -n limine-update 2>&1 | tee -a "${LOG_FILE}" || echo "WARNING: limine-update failed." >&2
-		else
-			echo "Skipping limine-update for mocked BOOT_DIR ${BOOT_DIR} (would touch live /boot)."
-		fi
-		if boot_grep "STD" "${LIMINE_CONF}" && boot_grep "${target_ver}" "${LIMINE_CONF}"; then
-			echo "Limine entry verified for ${target_ver} (limine-update, STD + ver)."
-			tool_ok=1
-		else
-			echo "WARNING: limine-update did not yield STD + ${target_ver}; trying filtered fallback." >&2
-		fi
-	else
-		if [ -n "${MODESET_OPTS:-}" ]; then
-			modeset_hint="Include modeset opts in the new entry cmdline: ${MODESET_OPTS}"
-		else
-			modeset_hint="If NVIDIA is present, include nvidia-drm.modeset=1 in the new entry cmdline."
-		fi
-		cat <<EOF
-WARNING: STD kernel ${target_ver} not listed in ${LIMINE_CONF}.
-kernel-install creates a BLS entry, but Limine boots from limine.conf.
-No limine-entry-tool/limine-update found; trying filtered fallback below.
-Manual sync e.g.:
-  sudo -n limine-entry-tool --add-kernel std <vmlinuz-${target_ver}> <initramfs-${target_ver}>
-  sudo -n limine-entry-tool --tree
-  (or: sudo -n limine-update)
-${modeset_hint}
-EOF
-	fi
-	if [ "${tool_ok}" -eq 1 ]; then
+	echo "Limine positioned insert: deduping remnants and inserting /STD kernel ${target_ver} after KPP fallback..."
+	if ! awk ' /^[[:space:]]*\/\/std([[:space:]]|$)/ { skip_nested=1; next } skip_nested && /^[[:space:]]*$/ { skip_nested=0; print; next } skip_nested && /^\// { skip_nested=0 } skip_nested { if ($0 ~ /^[[:space:]]*(cmdline|CMDLINE):/) { skip_nested=0 } next } /^# STD([[:space:]]|$)/ { next } /^:STD([[:space:]]|$)/ { next } /^[[:space:]]*(PROTOCOL|KERNEL_PATH|MODULE_PATH|CMDLINE):/ { next } /^\/STD kernel([[:space:]]|\(|$)/ { skip_std=1; next } skip_std && /^[[:space:]]+(protocol|kernel_path|module_path|cmdline|comment):/ { next } skip_std && /^[[:space:]]*(PROTOCOL|KERNEL_PATH|MODULE_PATH|CMDLINE):/ { next } skip_std && /^[[:space:]]*$/ { skip_std=0; print; next } skip_std && /^\// { skip_std=0 } skip_std { skip_std=0 } { print } ' "${tmpfile}" >"${tmpfilt}" 2>/dev/null; then
+		echo "WARNING: cannot filter ${LIMINE_CONF}; rolling back ${backup}." >&2
+		sudo -n cp -a -- "${backup}" "${LIMINE_CONF}" || echo "WARNING: Limine rollback failed; restore ${backup} manually." >&2
+		rm -f -- "${tmpfile}" "${tmpfilt}" "${tmpnew}" "${tmpstanza}" "${tmpcmd}" 2>/dev/null || true
 		return 0
-	fi
-	# Filtered fallback: append a clearly-marked STD block (ver + modeset opts).
-	echo "Limine filtered fallback: appending STD block for ${target_ver} to ${LIMINE_CONF}..."
-	tmpfile="$(mktemp /tmp/std-limine-XXXXXX)"
-	tmpappend="${tmpfile}.append"
-	if [ -f "${LIMINE_CONF}" ]; then
-		if ! cat -- "${LIMINE_CONF}" >"${tmpfile}" 2>/dev/null; then
-			echo "WARNING: cannot read ${LIMINE_CONF}; rolling back ${backup}." >&2
-			sudo -n cp -a -- "${backup}" "${LIMINE_CONF}" || echo "WARNING: Limine rollback failed; restore ${backup} manually." >&2
-			rm -f -- "${tmpfile}" "${tmpappend}" 2>/dev/null || true
-			return 0
-		fi
-	else
-		# shellcheck disable=SC2024 # sudo -n applies to cat (root read); redirect targets user-owned tmpfile by design
-		if ! sudo -n cat -- "${LIMINE_CONF}" >"${tmpfile}" 2>/dev/null; then
-			echo "WARNING: cannot read ${LIMINE_CONF} via sudo -n; rolling back ${backup}." >&2
-			sudo -n cp -a -- "${backup}" "${LIMINE_CONF}" || true
-			rm -f -- "${tmpfile}" "${tmpappend}" 2>/dev/null || true
-			return 0
-		fi
 	fi
 	{
-		echo ""
-		echo "# STD ${target_ver} (generated by install.sh filtered fallback; remove with uninstall.sh --remove)"
-		echo ":STD ${target_ver}"
-		echo "    PROTOCOL: linux"
-		echo "    KERNEL_PATH: boot:///vmlinuz-${target_ver}"
-		echo "    MODULE_PATH: boot:///initramfs-${target_ver}.img"
-		if [ -n "${MODESET_OPTS:-}" ]; then
-			echo "    CMDLINE: ${MODESET_OPTS}"
-		else
-			# No inherited/hardware-keyed modeset opts: leave CMDLINE empty
-			# rather than injecting a spurious NVIDIA token on non-NVIDIA hosts.
-			echo "    CMDLINE:"
+		printf '%s\n' "/STD kernel (${target_ver})"
+		printf '%s\n' "    protocol: linux"
+		printf '%s\n' "    kernel_path: boot():/vmlinuz-${target_ver}"
+		printf '%s\n' "    module_path: boot():/initramfs-${target_ver}.img"
+		printf '%s\n' "    cmdline: ${std_cmdline}"
+		printf '%s\n' "    comment: No BLAKE2b hash check — safe after kernel reinstall"
+	} >"${tmpstanza}" 2>/dev/null || true
+	# Normalize em dash to UTF-8 bytes (printf — may vary); rewrite with literal bytes if needed.
+	# The stanza above uses a literal em dash via shell locale; ensure file holds UTF-8.
+	kpp_line="$(grep -n -F -- "/Devario KPP kernel" "${tmpfilt}" 2>/dev/null | grep -F -- "(fallback)" | cut -d: -f1 | head -n 1 || true)"
+	if [ -z "${kpp_line}" ]; then
+		cat -- "${tmpfilt}" >"${tmpnew}" 2>/dev/null || true
+		last_line="$(tail -n 1 "${tmpnew}" 2>/dev/null || true)"
+		if [ -n "${last_line}" ]; then
+			printf '\n' >>"${tmpnew}" 2>/dev/null || true
 		fi
-	} >"${tmpappend}" 2>/dev/null || true
-	if ! cat -- "${tmpappend}" >>"${tmpfile}" 2>/dev/null; then
-		echo "WARNING: cannot stage Limine fallback; rolling back ${backup}." >&2
+		cat -- "${tmpstanza}" >>"${tmpnew}" 2>/dev/null || true
+		printf '\n' >>"${tmpnew}" 2>/dev/null || true
+	else
+		end_line="$(awk -v s="${kpp_line}" 'NR>s { if ($0 ~ /^$/ || $0 ~ /^\//) { print NR; exit } }' "${tmpfilt}" 2>/dev/null || true)"
+		if [ -z "${end_line}" ]; then
+			content_end="$(wc -l < "${tmpfilt}" 2>/dev/null | tr -d ' ' || echo 0)"
+			case "${content_end}" in ''|*[!0-9]*) content_end=0 ;; esac
+			head -n "${content_end}" -- "${tmpfilt}" >"${tmpnew}" 2>/dev/null || true
+			last_line="$(tail -n 1 "${tmpnew}" 2>/dev/null || true)"
+			if [ -n "${last_line}" ]; then
+				printf '\n' >>"${tmpnew}" 2>/dev/null || true
+			fi
+			cat -- "${tmpstanza}" >>"${tmpnew}" 2>/dev/null || true
+			printf '\n' >>"${tmpnew}" 2>/dev/null || true
+		else
+			content_end=$((end_line - 1))
+			head -n "${content_end}" -- "${tmpfilt}" >"${tmpnew}" 2>/dev/null || true
+			last_head="$(tail -n 1 "${tmpnew}" 2>/dev/null || true)"
+			if [ -n "${last_head}" ]; then
+				printf '\n' >>"${tmpnew}" 2>/dev/null || true
+			fi
+			cat -- "${tmpstanza}" >>"${tmpnew}" 2>/dev/null || true
+			first_tail="$(sed -n "${end_line}p" "${tmpfilt}" 2>/dev/null || true)"
+			if [ -n "${first_tail}" ]; then
+				printf '\n' >>"${tmpnew}" 2>/dev/null || true
+			fi
+			tail -n +"${end_line}" -- "${tmpfilt}" >>"${tmpnew}" 2>/dev/null || true
+		fi
+	fi
+	default_post="$(grep -E -- '^default_entry:' "${tmpnew}" 2>/dev/null || true)"
+	if [ "${default_pre}" != "${default_post}" ]; then
+		echo "WARNING: default_entry changed during Limine update; rolling back ${backup}." >&2
 		sudo -n cp -a -- "${backup}" "${LIMINE_CONF}" || echo "WARNING: Limine rollback failed; restore ${backup} manually." >&2
-		rm -f -- "${tmpfile}" "${tmpappend}" 2>/dev/null || true
+		rm -f -- "${tmpfile}" "${tmpfilt}" "${tmpnew}" "${tmpstanza}" "${tmpcmd}" 2>/dev/null || true
 		return 0
 	fi
-	if ! sudo -n cp -a -- "${tmpfile}" "${LIMINE_CONF}"; then
+	if ! sudo -n cp -a -- "${tmpnew}" "${LIMINE_CONF}"; then
 		echo "WARNING: Limine filtered write failed; rolling back ${backup}." >&2
 		sudo -n cp -a -- "${backup}" "${LIMINE_CONF}" || echo "WARNING: Limine rollback failed; restore ${backup} manually." >&2
-		rm -f -- "${tmpfile}" "${tmpappend}" 2>/dev/null || true
+		rm -f -- "${tmpfile}" "${tmpfilt}" "${tmpnew}" "${tmpstanza}" "${tmpcmd}" 2>/dev/null || true
 		return 0
 	fi
-	rm -f -- "${tmpfile}" "${tmpappend}" 2>/dev/null || true
-	if [ "${BOOT_DIR}" = "/boot" ]; then
-		if command -v limine-entry-tool >/dev/null 2>&1; then
-			sudo -n limine-entry-tool --tree 2>&1 | tee -a "${LOG_FILE}" || echo "WARNING: limine-entry-tool --tree failed after filter." >&2
-		elif command -v limine-update >/dev/null 2>&1; then
-			sudo -n limine-update 2>&1 | tee -a "${LOG_FILE}" || echo "WARNING: limine-update failed after filter." >&2
-		fi
-	else
-		echo "Skipping bootloader tree refresh for mocked BOOT_DIR ${BOOT_DIR} (would touch live /boot)."
+	rm -f -- "${tmpfile}" "${tmpfilt}" "${tmpnew}" "${tmpstanza}" "${tmpcmd}" 2>/dev/null || true
+	if command -v b2sum >/dev/null 2>&1; then
+		sudo -n b2sum -- "${LIMINE_CONF}" 2>/dev/null | awk '{print "Limine conf b2sum (post): " $1}' || b2sum -- "${LIMINE_CONF}" 2>/dev/null | awk '{print "Limine conf b2sum (post): " $1}' || true
 	fi
-	if boot_grep "STD" "${LIMINE_CONF}" && boot_grep "${target_ver}" "${LIMINE_CONF}"; then
-		echo "Limine entry verified for ${target_ver} (filtered fallback, STD + ver)."
-		if command -v b2sum >/dev/null 2>&1; then
-			sudo -n b2sum -- "${LIMINE_CONF}" 2>/dev/null | awk '{print "Limine conf b2sum (post): " $1}' || b2sum -- "${LIMINE_CONF}" 2>/dev/null | awk '{print "Limine conf b2sum (post): " $1}' || true
-		fi
+	if boot_grep_same_line "/STD kernel" "(${target_ver})" "${LIMINE_CONF}"; then
+		echo "Limine entry verified for ${target_ver} (positioned /STD kernel, same line)."
+		return 0
+	fi
+	if boot_grep_same_line ":STD" "${target_ver}" "${LIMINE_CONF}"; then
+		echo "Limine entry verified for ${target_ver} (legacy :STD compat, same line)."
 		return 0
 	fi
 	echo "WARNING: Limine verify failed for ${target_ver}; rolling back ${backup}." >&2
@@ -1487,6 +1994,10 @@ EOF
 # GRUB: backup grub.cfg, grub-mkconfig/grub2-mkconfig, verify KERNEL_VER present.
 update_grub() {
 	target_ver="$1"
+	if ! is_safe_ver "${target_ver}"; then
+		echo "update_grub: refusing unsafe target version: ${target_ver}" >&2
+		return 1
+	fi
 	grub_cfg=""
 	for cand in "${BOOT_DIR}/grub/grub.cfg" "${BOOT_DIR}/grub2/grub.cfg"; do
 		if boot_test_file "${cand}"; then
@@ -1545,6 +2056,10 @@ update_grub() {
 # unless --write-bls is given (opt-in write with --yes; preview in read-only).
 verify_bls() {
 	target_ver="$1"
+	if ! is_safe_ver "${target_ver}"; then
+		echo "verify_bls: refusing unsafe target version: ${target_ver}" >&2
+		return 1
+	fi
 	BLS_DIR="${BOOT_DIR}/loader/entries"
 	found=0
 	if [ -d "${BLS_DIR}" ]; then
@@ -2531,7 +3046,7 @@ if ! check_initramfs_health "${KERNEL_VER}"; then
 	exit 1
 fi
 
-# Slice 3: bootloader matrix (Limine 4-candidate/add-kernel/tree+limine-update/filtered fallback/verify/rollback,
+# Slice 3: bootloader matrix (Limine 4-candidate/positioned filtered insert/verify/rollback,
 # GRUB backup/mkconfig/verify, BLS kernel-install verify + opt-in --write-bls, modeset assert). Warn-only helpers
 # except modeset which is fatal only with --strict-nvidia.
 update_limine "${KERNEL_VER}"

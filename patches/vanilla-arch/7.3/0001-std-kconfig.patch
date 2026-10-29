@@ -1,4 +1,4 @@
-From 1e8b137f15d57d9ff87251baa2d7d0c990d5c460 Mon Sep 17 00:00:00 2001
+From 1e8b137f15d57d9ff87251baa2d7c990d5c460 Mon Sep 17 00:00:00 2001
 From: Galih Tama <galpt@v.recipes>
 Date: Thu, 29 Oct 2026 01:49:42 +0700
 Subject: [PATCH 1/4] STD: add Kconfig SMART_TASK_DISTRIBUTOR
@@ -6,10 +6,10 @@ Subject: [PATCH 1/4] STD: add Kconfig SMART_TASK_DISTRIBUTOR
 Add SMART_TASK_DISTRIBUTOR behind kernel/Kconfig.preempt with
 default y. The shim stays above deadline and never adds a new
 scheduling class. Fair and idle tasks prefer housekeeping while
-deadline plus real-time tasks prefer non-housekeeping; steering is
-a best-effort soft hint without guarantee, EXT defers to SCX and the
-core check is rq-wide and may over-skip. Default on keeps single
-image behavior simple.
+deadline plus real-time tasks prefer non-housekeeping; steering uses
+deficit enforcement with affinity-safe fallback, EXT defers to SCX
+and the core check is rq-wide and may over-skip. Default on keeps
+single image behavior simple.
 
 Signed-off-by: Galih Tama <galpt@v.recipes>
 ---
@@ -17,7 +17,7 @@ Signed-off-by: Galih Tama <galpt@v.recipes>
  1 file changed, 10 insertions(+)
 
 diff --git a/kernel/Kconfig.preempt b/kernel/Kconfig.preempt
-index f294dad43..27ccc4a2a 100644
+index f294dad43..442ff2c2e 100644
 --- a/kernel/Kconfig.preempt
 +++ b/kernel/Kconfig.preempt
 @@ -197,3 +197,13 @@ config SCHED_CLASS_EXT
@@ -32,8 +32,7 @@ index f294dad43..27ccc4a2a 100644
 +	  Route tasks above the deadline class without adding a new
 +	  scheduling class. Fair and idle tasks prefer housekeeping and
 +	  deadline plus real-time tasks prefer non-housekeeping CPUs.
-+	  Steering is best-effort soft hint without guarantee; EXT defers
++	  Steering uses deficit enforcement with affinity-safe fallback; EXT defers
 +	  to SCX, core rq-wide may over-skip, affinity/small honored, toggle via std_running.
 -- 
 2.56.0
-

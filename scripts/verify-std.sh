@@ -21,7 +21,7 @@
 #
 # Sudo block (fail-closed `sudo -n` only, never bare `sudo`; one line at a time):
 #   sudo -n stat -c %s -- /boot/initramfs-7.3.0-std.img
-#   sudo -n grep -F -- STD /boot/limine.conf | grep -F -- 7.3.0-std (same line via pipe; BLS never satisfies)
+#   sudo -n grep -F -- "/STD kernel" /boot/limine.conf | grep -F -- "(7.3.0-std)" (same line via pipe; legacy `:STD 7.3.0-std` also accepted with token-boundary; BLS never satisfies)
 #   sudo -n modinfo -k 7.3.0-std -F filename nvidia
 #   sudo -n find -- /lib/modules/7.3.0-std -name 'nvidia.ko*'
 #   sudo -n dmesg | grep -E -- 'std_running|std_stats|register_sysctl_sz|procname null|(^|[^A-Za-z0-9_])STD([^A-Za-z0-9_]|$)'
@@ -36,17 +36,20 @@
 #     or a non-STD release (e.g. `7.3.0-1.3-devario-kpp` means the wrong
 #     entry was booted).
 #   sysctl kernel.std_running: expected exact `kernel.std_running = 1`
-#     (anchored `^kernel\.std_running *= *1$`; master switch on); `0` means
-#     steering is disabled (boot override `std_running=0/1`); missing key
-#     means a non-STD kernel is running.
-#   cat std_running: expected `1`; same anomalous cases as sysctl.
+#     (anchored `^kernel\.std_running *= *[01]$`; master switch); `1` is
+#     enforcement (default), `0` is off
+#     (boot override `std_running=0/1`); missing key means non-STD.
+#   cat std_running: expected `0` or `1`; same cases as sysctl.
 #   cat std_stats: expected dynamic-width bordered approximate table with
-#     `fastpath` / `steered` / `fallback` columns, `+...+` top/middle/bottom
-#     borders plus `|` header/value rows (checked: 3 headers, >=3 `+` borders,
-#     >=2 `|` rows, >=5 lines; `0444` read-only via stat, never chmod;
-#     write probe omitted to stay read-only, `-EROFS` on write is source-
-#     documented from proc_std_stats, not live-probed); anomalous is missing
-#     file, empty output, or a table without `+---+` borders and the three headers.
+#     `fastpath` / `steered` / `fallback` / `sparse` / `bulk` /
+#     `decaying` / `host_load` in order plus enforcement suffix
+#     `enforced` / `denied` / `starve_bypass` in order (scaled SI-1000),
+#     `+...+` top/middle/bottom borders plus `|` header/value rows (checked:
+#     10 columns in order, >=3 `+` borders, >=2 `|` rows, >=5 lines; `0444`
+#     read-only via stat, never chmod; write probe omitted to stay read-only,
+#     `-EROFS` on write is source-documented from proc_std_stats, not
+#     live-probed); anomalous is missing file, empty output, or a table
+#     without `+---+` borders and the 10 columns in order.
 #   dmesg negative: expected empty for `grep -E -- 'std_running|std_stats|register_sysctl_sz|procname null|(^|[^A-Za-z0-9_])STD([^A-Za-z0-9_]|$)'`
 #     (STD emits no printk; do NOT use `grep -i std` alone: `zstd`,
 #     `systemd`, `BTRFS` are false positives; portable `(^|[^A-Za-z0-9_])STD`
@@ -58,17 +61,18 @@
 #     the `sudo -n` variant instead of changing permissions.
 #   taskset smoke: expected exit `0` for `taskset -c 0 sleep 0` plus a
 #     printed affinity mask for `taskset -p $$` (1-2 CPU systems pass
-#     through unchanged; steering is a best-effort soft hint, never a
-#     hard partition); anomalous is a non-zero exit or affinity error.
+#     through unchanged; enforcement denies only with in-group allowed);
+#     anomalous is a non-zero exit or affinity error.
 #   stat initrd: expected size `>=50M` (`52428800` bytes; stock is hundreds
 #     of MB); anomalous is missing image, `0` bytes, or `<50M` (degraded,
 #     fail-closed: do NOT boot, rebuild manually).
 #   modules: expected `>=1000` `.ko` files under `/lib/modules/<ver>`
 #     (healthy installs carry several thousand); anomalous is a missing
 #     directory or count `<1000` (degraded install).
-#   Limine: expected BOTH `STD` and the exact `<ver>` on the SAME line
-#     (`:STD <ver>` title line; piped `grep -F -- STD | grep -F -- <ver>`
-#     enforces same-line, file-level co-occurrence alone does NOT satisfy)
+#   Limine: expected canonical `/STD kernel (<ver>)` with `STD` and the exact
+#     `<ver>` on the SAME line (piped `grep -F -- "/STD kernel" | grep -F -- "(<ver>)"`
+#     enforces same-line exact, file-level co-occurrence alone does NOT satisfy;
+#     legacy `:STD <ver>` also accepted for compat with token-boundary)
 #     in `limine.conf` (4 candidates under BOOT_DIR); anomalous is either
 #     token missing, no `limine.conf` found, or BLS-only (a BLS entry
 #     never satisfies Limine). Do NOT reboot without a Limine STD+ver entry.
@@ -174,9 +178,21 @@ fi
 # no glob, no empty, no leading dash/dot; explicit dot-only guard rejects
 # "." and ".." directory traversal even though the regex already excludes
 # a lone "." via the leading-class rule).
+# Newline/tab/space/control pre-reject before grep: grep -E ^...$ matches
+# per line, so an embedded newline ("ok\nbad") would otherwise pass.
+# The shell case fails closed on any char outside the allowlist (covers
+# space, tab, newline and controls) plus a leading-class check, then grep
+# re-validates the full token as defense in depth.
 is_safe_ver() {
 	case "${1:-}" in
 		"."|"..") return 1 ;;
+	esac
+	case "${1:-}" in
+		*[!A-Za-z0-9._+-]*) return 1 ;;
+	esac
+	case "${1:-}" in
+		[A-Za-z0-9_]* ) ;;
+		*) return 1 ;;
 	esac
 	printf '%s' "${1:-}" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._+-]*$'
 }
@@ -217,19 +233,47 @@ boot_test_file() {
 }
 
 boot_grep_same_line() {
-	# Same-line check via pipe: line must contain BOTH pat1 and pat2.
+	# Same-line check via pipe: line must contain BOTH pat1 and pat2 (exact ver).
 	# File-level co-occurrence in different lines does NOT satisfy Limine
-	# (title line is `:STD <ver>`). Uses fixed strings (-F) with `--`.
+	# (title line is `/STD kernel (ver)` canonical, `:STD <ver>` legacy compat). Uses fixed strings (-F) with `--`.
+	# Exact ver: canonical requires "(ver)" with parens (prevents 7.3.0-std matching 7.3.0-std-dirty);
+	# legacy ":STD ver" requires token-boundary (ver not followed by [A-Za-z0-9._+-]).
 	pat1="$1"
 	pat2="$2"
 	file="$3"
-	if [ -f "${file}" ] && grep -F -- "${pat1}" "${file}" 2>/dev/null | grep -F -q -- "${pat2}"; then
-		return 0
-	fi
-	if [ "${HAVE_SUDO}" -eq 1 ] && sudo -n grep -F -- "${pat1}" "${file}" 2>/dev/null | grep -F -q -- "${pat2}"; then
-		return 0
-	fi
-	return 1
+	case "${pat1}" in
+		"/STD kernel"*)
+			case "${pat2}" in
+				"("*")") exact="${pat2}" ;;
+				*) exact="(${pat2})" ;;
+			esac
+			if [ -f "${file}" ] && grep -F -- "${pat1}" "${file}" 2>/dev/null | grep -F -q -- "${exact}"; then
+				return 0
+			fi
+			if [ "${HAVE_SUDO}" -eq 1 ] && sudo -n grep -F -- "${pat1}" "${file}" 2>/dev/null | grep -F -q -- "${exact}"; then
+				return 0
+			fi
+			return 1
+			;;
+		":STD"*)
+			if [ -f "${file}" ] && awk -v ver="${pat2}" 'index($0, ":STD")>0 { p=index($0, ":STD"); rest=substr($0, p+4); sub(/^[ \t]+/, "", rest); if (substr(rest,1,length(ver))==ver) { after=substr(rest, length(ver)+1, 1); if (after=="" || after !~ /[A-Za-z0-9._+\-]/) { found=1; exit 0 } } } END { exit !found }' "${file}" 2>/dev/null; then
+				return 0
+			fi
+			if [ "${HAVE_SUDO}" -eq 1 ] && sudo -n awk -v ver="${pat2}" 'index($0, ":STD")>0 { p=index($0, ":STD"); rest=substr($0, p+4); sub(/^[ \t]+/, "", rest); if (substr(rest,1,length(ver))==ver) { after=substr(rest, length(ver)+1, 1); if (after=="" || after !~ /[A-Za-z0-9._+\-]/) { found=1; exit 0 } } } END { exit !found }' "${file}" 2>/dev/null; then
+				return 0
+			fi
+			return 1
+			;;
+		*)
+			if [ -f "${file}" ] && grep -F -- "${pat1}" "${file}" 2>/dev/null | grep -F -q -- "${pat2}"; then
+				return 0
+			fi
+			if [ "${HAVE_SUDO}" -eq 1 ] && sudo -n grep -F -- "${pat1}" "${file}" 2>/dev/null | grep -F -q -- "${pat2}"; then
+				return 0
+			fi
+			return 1
+			;;
+	esac
 }
 
 boot_stat_size() {
@@ -277,14 +321,14 @@ case "${running}" in
 		;;
 esac
 
-# 2. sysctl kernel.std_running (no sudo; anchored `kernel.std_running = 1/0` match).
+# 2. sysctl kernel.std_running (no sudo; anchored `kernel.std_running = 0/1` match).
 echo "--- sysctl std_running ---"
 if sysctl_out="$(sysctl kernel.std_running 2>&1)"; then
 	echo "  ${sysctl_out}"
 	if printf '%s' "${sysctl_out}" | grep -Eq '^kernel\.std_running *= *1$'; then
-		echo "  OK: master switch on."
+		echo "  OK: master switch 1 (enforcement, default)."
 	elif printf '%s' "${sysctl_out}" | grep -Eq '^kernel\.std_running *= *0$'; then
-		note_fail "std_running is 0 (steering disabled; boot override std_running=0/1)."
+		echo "  OK: master switch 0 (steering off; boot override std_running=0/1)."
 	else
 		note_fail "unexpected sysctl output: ${sysctl_out}"
 	fi
@@ -297,9 +341,9 @@ echo "--- cat std_running ---"
 if running_val="$(cat /proc/sys/kernel/std_running 2>&1)"; then
 	echo "  /proc/sys/kernel/std_running: ${running_val}"
 	if [ "${running_val}" = "1" ]; then
-		echo "  OK: master switch on."
+		echo "  OK: master switch 1 (enforcement)."
 	elif [ "${running_val}" = "0" ]; then
-		note_fail "std_running is 0 (steering disabled)."
+		echo "  OK: master switch 0 (steering off)."
 	else
 		note_fail "unexpected std_running value: ${running_val}"
 	fi
@@ -313,16 +357,16 @@ fi
 echo "--- cat std_stats ---"
 if stats_out="$(cat /proc/sys/kernel/std_stats 2>&1)"; then
 	echo "${stats_out}" | head -n 10 | sed 's/^/  /'
-	border_count="$(printf '%s\n' "${stats_out}" | grep -c '^+.*+$' || true)"
-	pipe_count="$(printf '%s\n' "${stats_out}" | grep -c '|' || true)"
+	border_count="$(printf '%s\n' "${stats_out}" | grep -c -- '^+.*+$' || true)"
+	pipe_count="$(printf '%s\n' "${stats_out}" | grep -F -c -- '|' || true)"
 	line_count="$(printf '%s\n' "${stats_out}" | wc -l | tr -d ' ' || true)"
 	case "${border_count}" in ''|*[!0-9]*) border_count=0 ;; esac
 	case "${pipe_count}" in ''|*[!0-9]*) pipe_count=0 ;; esac
 	case "${line_count}" in ''|*[!0-9]*) line_count=0 ;; esac
-	if printf '%s' "${stats_out}" | grep -q "fastpath" && printf '%s' "${stats_out}" | grep -q "steered" && printf '%s' "${stats_out}" | grep -q "fallback" && [ "${border_count}" -ge 3 ] && [ "${pipe_count}" -ge 2 ] && [ "${line_count}" -ge 5 ]; then
-		echo "  OK: bordered table with fastpath / steered / fallback (${border_count} borders, ${pipe_count} piped rows, ${line_count} lines)."
+	if printf '%s' "${stats_out}" | grep -Eq -- "fastpath.*steered.*fallback.*sparse.*bulk.*decaying.*host_load.*enforced.*denied.*starve_bypass" && [ "${border_count}" -ge 3 ] && [ "${pipe_count}" -ge 2 ] && [ "${line_count}" -ge 5 ]; then
+		echo "  OK: bordered table with fastpath / steered / fallback / sparse / bulk / decaying / host_load / enforced / denied / starve_bypass in order (${border_count} borders, ${pipe_count} piped rows, ${line_count} lines)."
 	else
-		note_fail "std_stats lacks bordered fastpath/steered/fallback table (need 3 headers, >=3 '+' borders, >=2 '|' rows, >=5 lines; got borders=${border_count} pipes=${pipe_count} lines=${line_count})."
+		note_fail "std_stats lacks bordered 10-column table in order (need fastpath/steered/fallback/sparse/bulk/decaying/host_load/enforced/denied/starve_bypass in order, >=3 '+' borders, >=2 '|' rows, >=5 lines; got borders=${border_count} pipes=${pipe_count} lines=${line_count})."
 	fi
 	# Read-only mode check (stat only, never chmod): expect 0444 (`stat -c %a` reports 444).
 	# Direct stat first, sudo -n fallback for hardened /proc mounts; unknown is
@@ -434,7 +478,7 @@ else
 	note_fail "module count ${mod_count} <1000 (degraded install)."
 fi
 
-# 9. Limine STD+ver confirm (4 candidates, BOTH tokens on the SAME line; BLS never satisfies).
+# 9. Limine STD+ver confirm (4 candidates, canonical `/STD kernel (ver)` same-line; legacy `:STD ver` accepted for compat; BLS never satisfies).
 echo "--- Limine ---"
 LIMINE_CONF=""
 for cand in "${BOOT_DIR}/limine.conf" "${BOOT_DIR}/limine/limine.conf" "${BOOT_DIR}/EFI/BOOT/limine.conf" "${BOOT_DIR}/boot/limine.conf"; do
@@ -447,10 +491,12 @@ if [ -z "${LIMINE_CONF}" ]; then
 	note_fail "no limine.conf under ${BOOT_DIR} (4 candidates checked)."
 else
 	echo "  limine.conf: ${LIMINE_CONF}"
-	if boot_grep_same_line "STD" "${TARGET_VER}" "${LIMINE_CONF}"; then
-		echo "  OK: Limine entry present (STD + ${TARGET_VER} on the same line; BLS never satisfies)."
+	if boot_grep_same_line "/STD kernel" "(${TARGET_VER})" "${LIMINE_CONF}"; then
+		echo "  OK: Limine entry present (/STD kernel + ${TARGET_VER} on the same line; BLS never satisfies)."
+	elif boot_grep_same_line ":STD" "${TARGET_VER}" "${LIMINE_CONF}"; then
+		echo "  OK: Limine entry present (legacy :STD + ${TARGET_VER} compat; BLS never satisfies)."
 	else
-		note_fail "Limine entry lacks STD+${TARGET_VER} on the same line in ${LIMINE_CONF} (sync before reboot; BLS never satisfies)."
+		note_fail "Limine entry lacks /STD kernel+${TARGET_VER} on the same line in ${LIMINE_CONF} (sync before reboot; BLS never satisfies)."
 	fi
 fi
 
@@ -477,9 +523,9 @@ fi
 echo "--- dkms status ---"
 DKMS_ARCH="$(uname -m 2>/dev/null || echo x86_64)"
 if command -v dkms >/dev/null 2>&1; then
-	if dkms status 2>/dev/null | grep -F -- "${TARGET_VER}" | grep -F -- "${DKMS_ARCH}" | grep -qi "nvidia"; then
-		dkms status 2>/dev/null | grep -F -- "${TARGET_VER}" | grep -F -- "${DKMS_ARCH}" | grep -i "nvidia" | head -n 5 | sed 's/^/  /'
-		if dkms status 2>/dev/null | grep -F -- "${TARGET_VER}" | grep -F -- "${DKMS_ARCH}" | grep -i "nvidia" | grep -qi "installed"; then
+	if dkms status 2>/dev/null | grep -F -- "${TARGET_VER}" | grep -F -- "${DKMS_ARCH}" | grep -F -qi -- "nvidia"; then
+		dkms status 2>/dev/null | grep -F -- "${TARGET_VER}" | grep -F -- "${DKMS_ARCH}" | grep -F -i -- "nvidia" | head -n 5 | sed 's/^/  /'
+		if dkms status 2>/dev/null | grep -F -- "${TARGET_VER}" | grep -F -- "${DKMS_ARCH}" | grep -F -i -- "nvidia" | grep -F -qi -- "installed"; then
 			echo "  OK: dkms lists nvidia for ${TARGET_VER} as installed (${DKMS_ARCH})."
 		else
 			note_fail "dkms nvidia entry for ${TARGET_VER} is not installed on ${DKMS_ARCH} (built/added/failed)."

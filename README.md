@@ -2,12 +2,12 @@
 
 ## Overview
 
-STD aims to provide better desktop interactivity by best-effort spreading of DL and RT tasks away from Fair and idle tasks; extensible (EXT) tasks defer to SCX and are not steered.
+STD aims to provide better desktop interactivity by deficit-enforced steering of DL and RT tasks away from Fair and idle tasks; extensible (EXT) tasks defer to SCX and are not steered.
 
-STD steers wakeups above deadline without a new scheduling class. Fair and idle tasks prefer housekeeping CPUs. Deadline and real-time tasks prefer non-housekeeping CPUs. Affinity uses `cpumask` intersection with fallback soft hint and best-effort spreading without guarantee. Stop tasks are never intercepted while pinned, migrate-disabled, core-scheduled (rq-wide, may over-skip) and EXT pass through.
+STD steers wakeups above deadline without a new scheduling class. Fair and idle tasks prefer housekeeping CPUs. Deadline and real-time tasks prefer non-housekeeping CPUs. Affinity uses `cpumask` intersection with fallback and deficit enforcement. Stop tasks are never intercepted while pinned, migrate-disabled, core-scheduled (rq-wide, may over-skip) and EXT pass through.
 
 > [!NOTE]
-> STD will disable itself for machines with less than 3 cores.
+> STD disables itself on <3 online CPUs.
 
 ## Project Structure
 
@@ -57,21 +57,21 @@ scripts/uninstall.sh --remove --yes linux-fresh-7.3
 uname -r
 # expect 7.3.0-std (clean) or 7.3.0-std-dirty (expected dirt only)
 sysctl kernel.std_running
-# expect 1
+# expect 1 (enforcement, default); 0 off
 cat /proc/sys/kernel/std_running /proc/sys/kernel/std_stats
-# expect 1 plus approximate bordered table with fastpath / steered / fallback
+# expect 1 plus bordered 10-column table (fastpath / steered / fallback / sparse / bulk / decaying / host_load / enforced / denied / starve_bypass)
 taskset -c 0 sleep 0
 taskset -p $$
 ```
 
-Confirm with `patch --dry-run`, `git apply --check` and `checkpatch.pl --strict` (near-zero disabled cost when off). Build scheduler objects and test affinity with `taskset`; steering is best-effort soft hint.
+Confirm with `patch --dry-run`, `git apply --check` and `checkpatch.pl --strict` (near-zero disabled cost when off). Build scheduler objects and test affinity with `taskset`; enforcement on by default, 0 disables.
 
 ## Tunables
 
 | Tunable | Path | Range | Default | Description |
 |---|---|---|---|---|
-| `std_running` | `/proc/sys/kernel/std_running` | `0` or `1` | `1` | Master switch. `0` disables steering (near-zero cost), `1` enables best-effort soft hint. |
-| `std_stats` | `/proc/sys/kernel/std_stats` | — | — | Dynamic-width bordered approximate table of per-CPU sums (`fastpath`, `steered`, `fallback`); `slab.h`, `kmalloc_array` + `kmalloc` + `kfree`, measured widths, `memory_read_from_buffer`. |
+| `std_running` | `/proc/sys/kernel/std_running` | `0` or `1` | `1` | Master switch. `1` enforcement (default), `0` off (near-zero cost). |
+| `std_stats` | `/proc/sys/kernel/std_stats` | — | — | Bordered 10-column table of per-CPU sums (`fastpath`, `steered`, `fallback`, `sparse`, `bulk`, `decaying`, `host_load`, `enforced`, `denied`, `starve_bypass`); measured widths, `memory_read_from_buffer`. |
 
 > [!TIP]
 > This is optional. After booting the STD entry, verify steering without changing boot config via `cat`, `taskset`, and `sysctl` above (restore to `1` afterwards).
@@ -85,11 +85,11 @@ flowchart TD
     B -- 1 --> C{isolation? small? stop? pinned? migrating? core(rq-wide)? EXT?} %% guards in code order
     C -- passthrough --> Z
     C -- steerable --> D{dl or rt?}
-    D -- yes --> E[prefer non-housekeeping idle, best-effort spread, fallback]
+    D -- yes --> E[prefer non-housekeeping, deficit-ranked, fallback]
     D -- no --> F{idle or fair?}
-    F -- yes --> G[prefer housekeeping idle, best-effort spread, fallback]
+    F -- yes --> G[prefer housekeeping, deficit-ranked, fallback]
     F -- no --> Z
-    E --> H[fastpath / steered / fallback counters]
+    E --> H[10 counters: fastpath / steered / fallback / sparse / bulk / decaying / host_load / enforced / denied / starve_bypass]
     G --> H
     H --> Z
 ```
@@ -99,11 +99,11 @@ flowchart TD
 | Feature | Vanilla Kernel | With STD | sched-ext |
 |---|---|---|---|
 | New scheduling class | — | No (shim above deadline) | Yes (`sched_ext`) |
-| Fair/idle prefer housekeeping | No | Yes (soft hint, best-effort, affinity-safe) | Policy-dependent |
-| Deadline/RT prefer non-housekeeping | No | Yes (idle + best-effort spread) | Policy-dependent |
+| Fair/idle prefer housekeeping | No | Yes (deficit-ranked, affinity-safe) | Policy-dependent |
+| Deadline/RT prefer non-housekeeping | No | Yes (deficit-ranked, affinity-safe) | Policy-dependent |
 | Small-system guard (<3 CPUs) | — | Pass-through | Varies |
-| Live toggle | — | `kernel.std_running` + `std_running=` | Varies |
-| Read-only stats table | — | `kernel.std_stats` bordered, `-EROFS` on write | Varies |
+| Live toggle | — | `kernel.std_running` (`0`/`1`) + `std_running=` | Varies |
+| Read-only stats table | — | `kernel.std_stats` bordered 10-column, `-EROFS` on write | Varies |
 | Fail-closed install | — | `sudo -n` only, `dry-run`/`status` no-mutate, `checkpatch --strict` | — |
 
 ## License

@@ -113,6 +113,12 @@ fi
 # that may not exist yet. Canonicalizes symlinks before same/nested checks.
 # Safety comes from the refuse-root/same/nested guards below, not from
 # existence checks, so -m does not weaken confinement.
+# Refuse empty/root BOOT_DIR before canonicalization (realpath -m would map
+# "" to PWD and hide an empty --boot-dir), then canonicalize and refuse again.
+# Mirrors scripts/verify-std.sh: install and verify share one rule.
+case "${BOOT_DIR}" in
+	""|"/"|"//") echo "Refusing unsafe BOOT_DIR: ${BOOT_DIR}" >&2; exit 1 ;;
+esac
 if command -v realpath >/dev/null 2>&1; then
 	KERNEL_DIR="$(realpath -m -- "${KERNEL_DIR}")"
 	BOOT_DIR="$(realpath -m -- "${BOOT_DIR}")"
@@ -121,10 +127,10 @@ else
 	BOOT_DIR="$(readlink -f -- "${BOOT_DIR}" 2>/dev/null || printf '%s' "${BOOT_DIR}")"
 fi
 case "${KERNEL_DIR}" in
-	""|"/") echo "Refusing unsafe KERNEL_DIR: ${KERNEL_DIR}" >&2; exit 1 ;;
+	""|"/"|"//") echo "Refusing unsafe KERNEL_DIR: ${KERNEL_DIR}" >&2; exit 1 ;;
 esac
 case "${BOOT_DIR}" in
-	""|"/") echo "Refusing unsafe BOOT_DIR: ${BOOT_DIR}" >&2; exit 1 ;;
+	""|"/"|"//") echo "Refusing unsafe BOOT_DIR: ${BOOT_DIR}" >&2; exit 1 ;;
 esac
 if [ "${KERNEL_DIR}" = "${BOOT_DIR}" ]; then
 	echo "KERNEL_DIR and BOOT_DIR must differ" >&2
@@ -137,31 +143,86 @@ case "${BOOT_DIR}/" in
 	"${KERNEL_DIR}/"*) echo "Refusing nested BOOT_DIR under KERNEL_DIR" >&2; exit 1 ;;
 esac
 
-# Allowlisted release/token check: ^[A-Za-z0-9._][A-Za-z0-9._+-]*$ (no slash, no glob, no empty, no leading dash).
+# Allowlisted release/token check: ^[A-Za-z0-9_][A-Za-z0-9._+-]*$ (no slash, no glob, no empty, no leading dash/dot; explicit dot-only guard rejects "." and ".." directory traversal).
+# Newline/tab/space/control pre-reject before grep: grep -E ^...$ matches per line,
+# so an embedded newline ("ok\nbad") would otherwise pass on the first line.
+# The shell case below fails closed on any char outside the allowlist (covers
+# space, tab, newline and controls) plus a leading-class check, then grep
+# re-validates the full token as defense in depth.
+# Mirrors scripts/verify-std.sh: install and verify share one rule.
 is_safe_ver() {
-	printf '%s' "${1:-}" | grep -Eq '^[A-Za-z0-9._][A-Za-z0-9._+-]*$'
+	case "${1:-}" in
+		"."|"..") return 1 ;;
+	esac
+	case "${1:-}" in
+		*[!A-Za-z0-9._+-]*) return 1 ;;
+	esac
+	case "${1:-}" in
+		[A-Za-z0-9_]* ) ;;
+		*) return 1 ;;
+	esac
+	printf '%s' "${1:-}" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._+-]*$'
 }
 
 # Limine 4-candidate parity with install.sh (direct + sudo -n).
 # Candidates: limine.conf, limine/limine.conf, EFI/BOOT/limine.conf, boot/limine.conf.
 # find_limine_conf prints the first readable candidate; list_limine_confs prints all.
-# has_std_ver reports 0 only when BOTH "STD" and the exact ver are found in the
-# same conf (install.sh guarantee parity; BLS never satisfies Limine).
+# has_std_ver reports 0 when canonical `/STD kernel (ver)` or legacy `:STD <ver>`
+# shares the SAME line with the exact ver in the same conf (piped grep;
+# file-level co-occurrence alone does NOT satisfy; BLS never satisfies Limine).
+# sudo -n only, never bare sudo.
+boot_grep_same_line() {
+	# Same-line check via pipe: line must contain BOTH pat1 and pat2 (exact ver).
+	# File-level co-occurrence in different lines does NOT satisfy Limine
+	# (title line is `/STD kernel (ver)` canonical, `:STD <ver>` legacy compat). Uses fixed strings (-F) with `--`.
+	# Exact ver: canonical requires "(ver)" with parens (prevents 7.3.0-std matching 7.3.0-std-dirty);
+	# legacy ":STD ver" requires token-boundary (ver not followed by [A-Za-z0-9._+-]).
+	# Mirrors scripts/verify-std.sh: install and verify share one rule.
+	pat1="$1"
+	pat2="$2"
+	file="$3"
+	case "${pat1}" in
+		"/STD kernel"*)
+			case "${pat2}" in
+				"("*")") exact="${pat2}" ;;
+				*) exact="(${pat2})" ;;
+			esac
+			if [ -f "${file}" ] && grep -F -- "${pat1}" "${file}" 2>/dev/null | grep -F -q -- "${exact}"; then
+				return 0
+			fi
+			if [ "${HAVE_SUDO:-0}" -eq 1 ] && sudo -n grep -F -- "${pat1}" "${file}" 2>/dev/null | grep -F -q -- "${exact}"; then
+				return 0
+			fi
+			return 1
+			;;
+		":STD"*)
+			if [ -f "${file}" ] && awk -v ver="${pat2}" 'index($0, ":STD")>0 { p=index($0, ":STD"); rest=substr($0, p+4); sub(/^[ \t]+/, "", rest); if (substr(rest,1,length(ver))==ver) { after=substr(rest, length(ver)+1, 1); if (after=="" || after !~ /[A-Za-z0-9._+\-]/) { found=1; exit 0 } } } END { exit !found }' "${file}" 2>/dev/null; then
+				return 0
+			fi
+			if [ "${HAVE_SUDO:-0}" -eq 1 ] && sudo -n awk -v ver="${pat2}" 'index($0, ":STD")>0 { p=index($0, ":STD"); rest=substr($0, p+4); sub(/^[ \t]+/, "", rest); if (substr(rest,1,length(ver))==ver) { after=substr(rest, length(ver)+1, 1); if (after=="" || after !~ /[A-Za-z0-9._+\-]/) { found=1; exit 0 } } } END { exit !found }' "${file}" 2>/dev/null; then
+				return 0
+			fi
+			return 1
+			;;
+		*)
+			if [ -f "${file}" ] && grep -F -- "${pat1}" "${file}" 2>/dev/null | grep -F -q -- "${pat2}"; then
+				return 0
+			fi
+			if [ "${HAVE_SUDO:-0}" -eq 1 ] && sudo -n grep -F -- "${pat1}" "${file}" 2>/dev/null | grep -F -q -- "${pat2}"; then
+				return 0
+			fi
+			return 1
+			;;
+	esac
+}
+
 has_std_ver() {
 	_conf="$1"
 	_ver="$2"
-	_has_std=1
-	_has_ver=1
-	if grep -F -q -- "STD" "${_conf}" 2>/dev/null || { [ "${HAVE_SUDO:-0}" -eq 1 ] && sudo -n grep -F -q -- "STD" "${_conf}" 2>/dev/null; }; then
-		_has_std=0
-	fi
-	if grep -F -q -- "${_ver}" "${_conf}" 2>/dev/null || { [ "${HAVE_SUDO:-0}" -eq 1 ] && sudo -n grep -F -q -- "${_ver}" "${_conf}" 2>/dev/null; }; then
-		_has_ver=0
-	fi
-	if [ "${_has_std}" -eq 0 ] && [ "${_has_ver}" -eq 0 ]; then
+	if boot_grep_same_line "/STD kernel" "(${_ver})" "${_conf}"; then
 		return 0
 	fi
-	return 1
+	boot_grep_same_line ":STD" "${_ver}" "${_conf}"
 }
 
 find_limine_conf() {
@@ -186,6 +247,22 @@ list_limine_confs() {
 			printf '%s\n' "${cand}"
 		fi
 	done
+}
+
+# Strip isolation tokens (mirrored without re-append): remove all
+# isolcpus=/nohz_full=/rcu_nocbs= (any value). Preserves order of the rest.
+# $1 = cmdline string. Idempotent; empty input yields empty output.
+strip_isolation_tokens() {
+	strip_in="${1:-}"
+	strip_out=""
+	# shellcheck disable=SC2086 # word-splitting of cmdline tokens is intentional (one token per word)
+	for strip_tok in ${strip_in}; do
+		case "${strip_tok}" in
+			isolcpus=*|nohz_full=*|rcu_nocbs=*) continue ;;
+			*) strip_out="${strip_out:+${strip_out} }${strip_tok}" ;;
+		esac
+	done
+	printf '%s' "${strip_out}"
 }
 
 # Expected STD dirt allowlist (status parity with install.sh).
@@ -430,11 +507,19 @@ uninstall_status() {
 	echo "Status complete (read-only, no changes made)."
 }
 
-# Limine STD-block removal with backup + tree/update refresh and rollback.
-# Automated (prefer tool-driven, filtered fallback); fail-closed on sudo -n/backup.
-# Never in --dry-run/--status. Verifies target_ver absent, rolls back on failure.
-# 4-candidate parity with install.sh: limine.conf, limine/limine.conf,
-# EFI/BOOT/limine.conf, boot/limine.conf under BOOT_DIR.
+# Limine standalone STD removal with backup and rollback.
+# Stanza delete of /STD kernel (ver) plus legacy/orphan dedupe, per candidate.
+# Retains tool phase for nested //std only (no tool for standalone stanza).
+# Removes nested //std (//std + kernel-id=std), legacy EOF (# STD + :STD +
+# UPPERCASE), orphan uppercase PROTOCOL:/CMDLINE: pairs, and the /STD kernel
+# stanza matching ver. Defensive post-filter strips residual isolation tokens
+# (isolcpus=/nohz_full=/rcu_nocbs= any value) file-wide via
+# strip_isolation_tokens so remove restores zero; primary removal stays the
+# STD stanza delete. Backup timestamped via sudo -n cp -a, b2sum pre/post,
+# same-line absence verify (canonical /STD kernel (ver) and legacy :STD ver
+# must both be absent), rollback on fail. Keeps 4-candidate search, is_safe_ver,
+# BOOT_DIR confinement, sudo -n only. DRY_RUN/STATUS never mutate. Preserves
+# default_entry.
 remove_limine_entry() {
 	target_ver="$1"
 	limine_list="$(list_limine_confs || true)"
@@ -454,7 +539,7 @@ remove_limine_entry() {
 		echo "WARNING: no sudo -n; cannot clean Limine entry for ${target_ver} (fail-closed). Remove STD block manually from 4 candidates under ${BOOT_DIR}." >&2
 		return 0
 	fi
-	# Back up every existing candidate before any tool/filter mutation.
+	# Back up every existing candidate before any mutation.
 	while IFS= read -r limine_conf; do
 		[ -z "${limine_conf}" ] && continue
 		case "${limine_conf}" in
@@ -463,7 +548,7 @@ remove_limine_entry() {
 			*)
 				echo "Skipping unexpected Limine path ${limine_conf}." >&2
 				continue
-				;;
+			;;
 		esac
 		backup="${limine_conf}.std-backup-$(date +%Y%m%d%H%M%S)"
 		echo "Backing up ${limine_conf} -> ${backup}..."
@@ -475,41 +560,20 @@ remove_limine_entry() {
 			b2sum -- "${limine_conf}" 2>/dev/null | awk '{print "Limine conf b2sum (pre): " $1}' || sudo -n b2sum -- "${limine_conf}" 2>/dev/null | awk '{print "Limine conf b2sum (pre, root-only): " $1}' || true
 		fi
 	done <<<"${limine_list}"
-	# Prefer tool-driven removal when scoped to the real /boot and the tool
-	# advertises a remove flag. For mocked BOOT_DIR, skip the tool (it would
-	# touch the real /boot) and use the filtered fallback scoped to BOOT_DIR.
+	# Tool phase for nested //std only when scoped to the real /boot.
+	# For mocked BOOT_DIR, skip the tool (it would touch live /boot) and rely
+	# on the filtered stanza delete below, which also handles nested.
 	if [ "${BOOT_DIR}" = "/boot" ] && command -v limine-entry-tool >/dev/null 2>&1 && sudo -n limine-entry-tool --help 2>&1 | grep -Eq -- '--remove'; then
-		echo "Removing Limine STD entry for ${target_ver} via limine-entry-tool..."
+		echo "Removing nested STD entry via tool (nested //std only)..."
 		if sudo -n limine-entry-tool --remove-kernel std 2>&1 | tee -a "${LOG_FILE}"; then
 			:
-		elif sudo -n limine-entry-tool --remove "${target_ver}" 2>&1 | tee -a "${LOG_FILE}"; then
-			:
 		else
-			echo "WARNING: limine-entry-tool remove failed; trying filtered fallback." >&2
+			echo "WARNING: tool remove for nested std failed; continuing to filtered stanza delete." >&2
 		fi
-		if sudo -n limine-entry-tool --tree 2>&1 | tee -a "${LOG_FILE}"; then
-			:
-		else
-			echo "WARNING: limine-entry-tool --tree failed after remove." >&2
-		fi
-		still_present=0
-		while IFS= read -r limine_conf; do
-			[ -z "${limine_conf}" ] && continue
-			# Removal verify: the STD+ver block for target_ver is gone only
-			# when ver is absent (filtered fallback drops STD and ver lines);
-			# has_std_ver parity: presence requires BOTH, so absence of ver
-			# implies the STD+ver entry is gone.
-			if sudo -n grep -F -q -- "${target_ver}" "${limine_conf}" 2>/dev/null || grep -F -q -- "${target_ver}" "${limine_conf}" 2>/dev/null; then
-				still_present=1
-			fi
-		done <<<"${limine_list}"
-		if [ "${still_present}" -eq 0 ]; then
-			echo "Limine STD entry removed for ${target_ver} (STD+ver verified absent, tool-driven, backups under ${BOOT_DIR})."
-			return 0
-		fi
-		echo "WARNING: Limine entry for ${target_ver} (STD+ver) still present after tool remove; trying filtered fallback." >&2
+	else
+		echo "Skipping tool phase for nested std (mocked BOOT_DIR or no tool; filtered stanza delete handles nested)."
 	fi
-	# Filtered fallback: drop lines containing STD or the exact target_ver, per candidate.
+	# Filtered stanza delete: remove /STD kernel (ver) plus legacy/orphan dedupe, per candidate.
 	filter_failed=0
 	while IFS= read -r limine_conf; do
 		[ -z "${limine_conf}" ] && continue
@@ -518,21 +582,20 @@ remove_limine_entry() {
 				;;
 			*)
 				continue
-				;;
+			;;
 		esac
-		# shellcheck disable=SC2012 # ls -t picks the newest backup (system-generated
-		# .std-backup-* names); no parsing of ownership/mode, so find offers no benefit.
+		# shellcheck disable=SC2012 # ls picks the newest backup (system-generated names); no ownership parsing, so find offers no benefit.
 		backup="$(ls -t -- "${limine_conf}.std-backup-"* 2>/dev/null | head -n 1 || true)"
 		if [ -z "${backup}" ]; then
 			backup="${limine_conf}.std-backup-$(date +%Y%m%d%H%M%S)"
 			echo "Backing up ${limine_conf} -> ${backup}..."
 			if ! sudo -n cp -a -- "${limine_conf}" "${backup}"; then
-				echo "WARNING: Limine backup failed for ${limine_conf}; skipping filtered fallback for this candidate." >&2
+				echo "WARNING: Limine backup failed for ${limine_conf}; skipping filtered delete for this candidate." >&2
 				filter_failed=1
 				continue
 			fi
 		fi
-		echo "Filtering STD/${target_ver} lines from ${limine_conf}..."
+		echo "Filtering STD entry for ${target_ver} from ${limine_conf} (stanza delete + legacy/orphan dedupe)..."
 		tmpfile="$(mktemp /tmp/std-limine-XXXXXX)"
 		tmpfilt="${tmpfile}.filtered"
 		if [ -f "${limine_conf}" ]; then
@@ -544,7 +607,7 @@ remove_limine_entry() {
 				continue
 			fi
 		else
-			# shellcheck disable=SC2024 # sudo -n applies to cat (root read); redirect targets user-owned tmpfile by design
+			# shellcheck disable=SC2024 # sudo applies to cat (root read); redirect is user-owned tmpfile by design
 			if ! sudo -n cat -- "${limine_conf}" >"${tmpfile}" 2>/dev/null; then
 				echo "WARNING: cannot read ${limine_conf} via sudo -n; restoring backup." >&2
 				sudo -n cp -a -- "${backup}" "${limine_conf}" || true
@@ -553,9 +616,80 @@ remove_limine_entry() {
 				continue
 			fi
 		fi
-		if ! grep -v -F -e "STD" -e "${target_ver}" -- "${tmpfile}" >"${tmpfilt}" 2>/dev/null; then
-			# grep -v exits 1 when every line filtered; treat empty result as valid.
-			: >"${tmpfilt}" || true
+		default_pre="$(grep -E -- '^default_entry:' "${tmpfile}" 2>/dev/null || true)"
+		if ! awk -v ver="${target_ver}" ' /^[[:space:]]*\/\/std([[:space:]]|$)/ { skip_nested=1; next } skip_nested && /^[[:space:]]*$/ { skip_nested=0; print; next } skip_nested && /^\// { skip_nested=0 } skip_nested { if ($0 ~ /^[[:space:]]*(cmdline|CMDLINE):/) { skip_nested=0 } next } /^# STD([[:space:]]|$)/ { next } /^:STD([[:space:]]|$)/ { next } /^[[:space:]]*(PROTOCOL|KERNEL_PATH|MODULE_PATH|CMDLINE):/ { next } /^\/STD kernel([[:space:]]|\(|$)/ { if (index($0, "(" ver ")") > 0) { skip_std=1; next } } skip_std && /^[[:space:]]+(protocol|kernel_path|module_path|cmdline|comment):/ { next } skip_std && /^[[:space:]]*(PROTOCOL|KERNEL_PATH|MODULE_PATH|CMDLINE):/ { next } skip_std && /^[[:space:]]*$/ { skip_std=0; print; next } skip_std && /^\// { skip_std=0 } skip_std { skip_std=0 } { print } ' "${tmpfile}" >"${tmpfilt}" 2>/dev/null; then
+			echo "WARNING: cannot filter ${limine_conf}; restoring backup." >&2
+			sudo -n cp -a -- "${backup}" "${limine_conf}" || echo "WARNING: Limine rollback failed; restore ${backup} manually." >&2
+			rm -f -- "${tmpfile}" "${tmpfilt}" 2>/dev/null || true
+			filter_failed=1
+			continue
+		fi
+		# Defensive post-filter (primary removal is the STD stanza delete above):
+		# strip residual isolation tokens file-wide so remove restores zero.
+		# Preserves root/rootflags/MODESET order; only cmdline/CMDLINE values
+		# are rewritten, default_entry untouched (verified below).
+		tmpstripped="${tmpfilt}.stripped"
+		strip_line=""
+		strip_trimmed=""
+		strip_prefix=""
+		strip_val=""
+		strip_cleaned=""
+		if ! {
+			while IFS= read -r strip_line || [ -n "${strip_line}" ]; do
+				strip_trimmed="${strip_line#"${strip_line%%[![:space:]]*}"}"
+				case "${strip_trimmed}" in
+					cmdline:*)
+						strip_prefix="${strip_line%%cmdline:*}cmdline:"
+						strip_val="${strip_line#*cmdline:}"
+						if strip_cleaned="$(strip_isolation_tokens "${strip_val}")"; then
+							if [ -z "${strip_cleaned}" ]; then
+								printf '%s\n' "${strip_prefix}"
+							else
+								printf '%s %s\n' "${strip_prefix}" "${strip_cleaned}"
+							fi
+						else
+							printf '%s\n' "${strip_line}"
+						fi
+						;;
+					CMDLINE:*)
+						strip_prefix="${strip_line%%CMDLINE:*}CMDLINE:"
+						strip_val="${strip_line#*CMDLINE:}"
+						if strip_cleaned="$(strip_isolation_tokens "${strip_val}")"; then
+							if [ -z "${strip_cleaned}" ]; then
+								printf '%s\n' "${strip_prefix}"
+							else
+								printf '%s %s\n' "${strip_prefix}" "${strip_cleaned}"
+							fi
+						else
+							printf '%s\n' "${strip_line}"
+						fi
+						;;
+					*)
+						printf '%s\n' "${strip_line}"
+						;;
+				esac
+			done <"${tmpfilt}" >"${tmpstripped}"
+		}; then
+			echo "WARNING: cannot strip isolation tokens for ${limine_conf}; restoring backup." >&2
+			sudo -n cp -a -- "${backup}" "${limine_conf}" || echo "WARNING: Limine rollback failed; restore ${backup} manually." >&2
+			rm -f -- "${tmpfile}" "${tmpfilt}" "${tmpstripped}" 2>/dev/null || true
+			filter_failed=1
+			continue
+		fi
+		if ! mv -- "${tmpstripped}" "${tmpfilt}"; then
+			echo "WARNING: cannot apply isolation strip for ${limine_conf}; restoring backup." >&2
+			sudo -n cp -a -- "${backup}" "${limine_conf}" || echo "WARNING: Limine rollback failed; restore ${backup} manually." >&2
+			rm -f -- "${tmpfile}" "${tmpfilt}" "${tmpstripped}" 2>/dev/null || true
+			filter_failed=1
+			continue
+		fi
+		default_post="$(grep -E -- '^default_entry:' "${tmpfilt}" 2>/dev/null || true)"
+		if [ "${default_pre}" != "${default_post}" ]; then
+			echo "WARNING: default_entry changed during Limine removal; rolling back ${backup}." >&2
+			sudo -n cp -a -- "${backup}" "${limine_conf}" || echo "WARNING: Limine rollback failed; restore ${backup} manually." >&2
+			rm -f -- "${tmpfile}" "${tmpfilt}" 2>/dev/null || true
+			filter_failed=1
+			continue
 		fi
 		if ! sudo -n cp -a -- "${tmpfilt}" "${limine_conf}"; then
 			echo "WARNING: Limine filtered write failed for ${limine_conf}; rolling back ${backup}." >&2
@@ -565,9 +699,8 @@ remove_limine_entry() {
 			continue
 		fi
 		rm -f -- "${tmpfile}" "${tmpfilt}" 2>/dev/null || true
-		# Removal verify (STD+ver parity): ver absence implies the STD+ver
-		# block for target_ver is gone (fallback drops both STD and ver lines).
-		if sudo -n grep -F -q -- "${target_ver}" "${limine_conf}" 2>/dev/null || grep -F -q -- "${target_ver}" "${limine_conf}" 2>/dev/null; then
+		# Removal verify (same-line absence): both canonical and legacy must be absent. BLS never satisfies.
+		if boot_grep_same_line "/STD kernel" "(${target_ver})" "${limine_conf}" || boot_grep_same_line ":STD" "${target_ver}" "${limine_conf}"; then
 			echo "WARNING: Limine verify failed for STD+ver ${target_ver} in ${limine_conf}; rolling back ${backup}." >&2
 			sudo -n cp -a -- "${backup}" "${limine_conf}" || echo "WARNING: Limine rollback failed; restore ${backup} manually." >&2
 			filter_failed=1
@@ -576,23 +709,12 @@ remove_limine_entry() {
 		if command -v b2sum >/dev/null 2>&1; then
 			sudo -n b2sum -- "${limine_conf}" 2>/dev/null | awk '{print "Limine conf b2sum (post): " $1}' || b2sum -- "${limine_conf}" 2>/dev/null | awk '{print "Limine conf b2sum (post): " $1}' || true
 		fi
-		echo "Limine STD entry removed for ${target_ver} in ${limine_conf} (filtered, backup at ${backup})."
+		echo "Limine STD entry removed for ${target_ver} in ${limine_conf} (stanza delete + dedupe, backup at ${backup})."
 	done <<<"${limine_list}"
-	# Refresh bootloader tree only when operating on the real /boot; for a
-	# mocked BOOT_DIR the tool would touch the live system, so skip it.
-	if [ "${BOOT_DIR}" = "/boot" ]; then
-		if command -v limine-entry-tool >/dev/null 2>&1; then
-			sudo -n limine-entry-tool --tree 2>&1 | tee -a "${LOG_FILE}" || echo "WARNING: limine-entry-tool --tree failed after filter." >&2
-		elif command -v limine-update >/dev/null 2>&1; then
-			sudo -n limine-update 2>&1 | tee -a "${LOG_FILE}" || echo "WARNING: limine-update failed after filter." >&2
-		fi
-	else
-		echo "Skipping bootloader tree refresh for mocked BOOT_DIR ${BOOT_DIR} (would touch live /boot)."
-	fi
 	if [ "${filter_failed}" -ne 0 ]; then
 		return 0
 	fi
-	echo "Limine STD entry removed for ${target_ver} (filtered, backups under ${BOOT_DIR})."
+	echo "Limine STD entry removed for ${target_ver} (stanza delete + dedupe, backups under ${BOOT_DIR})."
 	return 0
 }
 
@@ -616,7 +738,7 @@ do_remove() {
 			;;
 	esac
 	if ! is_safe_ver "${target_ver}"; then
-		echo "Refusing unsafe release for --remove (allowlist ^[A-Za-z0-9._][A-Za-z0-9._+-]*\$): ${target_ver}" >&2
+		echo "Refusing unsafe release for --remove (allowlist ^[A-Za-z0-9_][A-Za-z0-9._+-]*\$): ${target_ver}" >&2
 		return 1
 	fi
 	running=""
@@ -1019,7 +1141,8 @@ fi
 # When --remove was used, remove_limine_entry already attempted automated
 # cleanup with backup; any remainder needs manual restore from that backup.
 # 4-candidate parity with install.sh. STD+ver parity: an entry counts only
-# when BOTH "STD" and the exact ver are found (BLS never satisfies Limine).
+# when BOTH "STD" and the exact ver share the SAME line (`:STD <ver>` via
+# piped grep; file-level co-occurrence alone does NOT satisfy; BLS never satisfies Limine).
 FINAL_KREL="$(make -C "${KERNEL_DIR}" -s kernelrelease 2>/dev/null || echo "unknown")"
 case "${FINAL_KREL}" in
 	""|"unknown") FINAL_KREL_SAFE=0 ;;
