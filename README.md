@@ -80,16 +80,17 @@ Confirm with `patch --dry-run`, `git apply --check` and `checkpatch.pl --strict`
 
 ```mermaid
 flowchart TD
-    A[select_task_rq wakeup] --> B{std_running?}
-    B -- 0 --> Z[keep class CPU]
-    B -- 1 --> C{isolation? small? stop? pinned? migrating? core(rq-wide)? EXT?} %% guards in code order
-    C -- passthrough --> Z
-    C -- steerable --> D{dl or rt?}
-    D -- yes --> E[prefer non-housekeeping, deficit-ranked, fallback]
-    D -- no --> F{idle or fair?}
-    F -- yes --> G[prefer housekeeping, deficit-ranked, fallback]
-    F -- no --> Z
-    E --> H[10 counters: fastpath / steered / fallback / sparse / bulk / decaying / host_load / enforced / denied / starve_bypass]
+    A["select_task_rq wakeup"] --> B{"std_running?"}
+    B -->|0| Z["keep class CPU"]
+    B -->|1| C{"isolation? small? stop? pinned? migrating? core(rq-wide)? EXT?"}
+    %% guards in code order
+    C -->|passthrough| Z
+    C -->|steerable| D{"dl or rt?"}
+    D -->|yes| E["prefer non-housekeeping, deficit-ranked, fallback"]
+    D -->|no| F{"idle or fair?"}
+    F -->|yes| G["prefer housekeeping, deficit-ranked, fallback"]
+    F -->|no| Z
+    E --> H["10 counters: fastpath / steered / fallback / sparse / bulk / decaying / host_load / enforced / denied / starve_bypass"]
     G --> H
     H --> Z
 ```
