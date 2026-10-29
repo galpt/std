@@ -26,3 +26,7 @@ vmlinux
 *~
 *.swp
 *.bak
+*.log
+
+# Unnecessary for now.
+docs/
