@@ -146,10 +146,10 @@ You can also use `cat /proc/sys/kernel/std_stats` to check whether STD works as 
 | Scheduling classes | n/a | Existing hierarchy retained; wakeup choice | Yes (`sched_ext`) |
 | Boot prerequisites | n/a | Standard boot suffices | n/a |
 | Predictor | n/a | Tiny 64-16-1 s8/s32 ReLU threshold | Policy-dependent |
-| Fair placement | No | Opportunistic, affinity-safe | Policy-dependent |
-| RT placement | No | Idle destination only | No (higher class preempts SCX) |
-| DL placement | No | Laxity veto, else opportunistic | No |
-| Idle placement | No | Never migrates | n/a |
+| Fair placement | EEVDF with SIS via `select_task_rq_fair` | Opportunistic, affinity-safe | Policy-dependent |
+| RT placement | FIFO/RR push/pull via `select_task_rq_rt` | Idle destination only | No (higher class preempts SCX) |
+| DL placement | CBS/EDF placement via `select_task_rq_dl` | Laxity veto, else opportunistic | No (higher class preempts SCX) |
+| Idle placement | Pinned returns `task_cpu` via `select_task_rq_idle` | Never migrates | n/a |
 | Small-system guard (<3 CPUs) | n/a | Pass-through | Varies |
 | Live toggle | n/a | `kernel.std_running` (`0`/`1`) + `std_running=`, `kernel.std_nn_thresh` + `std_nn_thresh=` | Varies |
 | Read-only stats table | n/a | `kernel.std_stats` vertical 2-column metric/value, `-EROFS` on write | Varies |
