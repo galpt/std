@@ -1,19 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Smart Task Distributor (STD) routing shim.
+ * Smart Task Distributor (STD) routing code.
  *
- * STD adjusts the CPU selected at wakeup toward idle capacity.
- * A tiny fixed-point predictor guides fair movement; real-time
- * movement requires an idle destination, deadline movement
- * observes a laxity veto, and idle tasks remain in place.
- * Affinity derives from mask intersection, falling back to the
- * class-selected CPU. Stop tasks stay untouched, extensible
- * tasks remain with SCX, and steering pauses below three online
- * CPUs. Pinned, migrate-disabled and core-scheduled tasks pass
- * through; the core check is rq-wide and may over-skip.
- * Scanning prefers a fully idle core, then any idle CPU, then
- * a spread fallback without auxiliary masks, using integer
- * arithmetic alone on the wakeup path.
+ * STD moves wakeups toward idle capacity. A small fixed-point
+ * predictor guides fair tasks. Real-time moves need an idle
+ * destination. Deadline moves respect a laxity veto. Idle tasks
+ * stay where they are. The allowed mask decides the candidates
+ * and the first pick is kept when nothing fits. Stop tasks are
+ * never touched and SCX tasks stay with SCX. Steering pauses when
+ * fewer than three CPUs are online. Pinned tasks and tasks with
+ * migration off pass through, as do core-scheduled tasks. The scan
+ * favors a fully idle core and then any idle CPU and then a spread
+ * pick. All math on wakeup is integer only and uses no extra masks.
  */
 #include <linux/cpu.h>
 #include <linux/cpumask_api.h>
@@ -58,18 +56,19 @@ const int std_nn_version = 1;
 int std_nn_thresh;
 
 /*
- * Master switch for STD steering. Active by default, so placement
- * refinement starts immediately. Writes clamp to 0-1 through
- * sysctl minmax: 1 steers wakeups, 0 retains class choices
+ * Master switch for STD moves. It starts active so placement
+ * adjustment begins at once. Writes stay within 0 and 1 through
+ * sysctl minmax. A value of 1 moves wakeups and 0 keeps first picks
  * at near-zero cost.
  */
 int std_running = 1;
 
 /*
- * Boot-time switch: std_running= assigns the initial steering state,
- * 0 retaining class choices and 1 refining them. Parsed early via
- * __setup, letting one image serve embedded and server targets.
- * Only plain 0 or 1 parses; other spellings leave the default.
+ * Boot option for the first steering state. The std_running option
+ * assigns that state with 0 keeping first picks and 1 adjusting
+ * them. It is read early through __setup so one image fits both
+ * small and large targets. Only plain 0 or 1 parses and other text
+ * leaves the default.
  */
 static int __init setup_std_running(char *str)
 {
@@ -90,9 +89,9 @@ static int __init setup_std_running(char *str)
 __setup("std_running=", setup_std_running);
 
 /*
- * Boot-time threshold: std_nn_thresh=<s32>. Parsed early via __setup
- * as plain base-10; malformed or out-of-range input leaves
- * the built-in default in place.
+ * Boot option for the first threshold. The std_nn_thresh option
+ * takes a plain base-10 s32. It is read early through __setup and
+ * malformed or out-of-range input leaves the built-in default.
  */
 static int __init setup_std_nn_thresh(char *str)
 {
@@ -132,10 +131,11 @@ static inline s8 std_nn_w2(int h)
 }
 
 /*
- * Compact predictor: 64 u8 history entries feed 16 hidden s32 units
- * through ReLU into one s32 verdict weighed against std_nn_thresh,
- * requesting migration when positive and retention otherwise, built from
- * integer addition and multiplication in preallocated non-sleeping context.
+ * Small predictor built from 64 history entries and 16 hidden s32
+ * units closed by ReLU into one s32 verdict. The verdict is weighed
+ * against std_nn_thresh with a higher result asking to move and the
+ * rest asking to stay. It runs on integer addition and multiplication
+ * in preallocated non-sleeping context.
  */
 int std_nn_predict(const u8 hist[STD_HIST_LEN])
 {
@@ -283,7 +283,7 @@ static int proc_std_stats(const struct ctl_table *table, int dir,
 	if (!kbuf)
 		return -ENOMEM;
 
-	/* Top border: +---+---+ */
+	/* Draw the top border. */
 	kbuf[off++] = '+';
 	for (i = 0; i < (int)w0 + 2; i++)
 		kbuf[off++] = '-';
@@ -419,7 +419,7 @@ static unsigned int std_pick_opportunistic(struct task_struct *p, int cpu)
 	unsigned int c, sib;
 
 	(void)cpu;
-	/* Tier 1: whole idle core first (all siblings idle). */
+	/* Look first for a whole idle core with all siblings idle. */
 	for_each_cpu(c, p->cpus_ptr) {
 		const struct cpumask *smt;
 		bool all_idle = true;
@@ -438,7 +438,7 @@ static unsigned int std_pick_opportunistic(struct task_struct *p, int cpu)
 		for_each_cpu(sib, smt) {
 			if (sib == c)
 				continue;
-			/* Offline siblings never run: ignore, not a veto. */
+			/* Offline siblings never run, so ignore them without veto. */
 			if (!cpu_active(sib))
 				continue;
 			if (!available_idle_cpu(sib)) {
@@ -451,7 +451,7 @@ static unsigned int std_pick_opportunistic(struct task_struct *p, int cpu)
 	}
 	/* Without CONFIG_SCHED_SMT the tier-1 mask is a singleton, so tier 1 */
 	/* trivially matches every active idle CPU and collapses to tier 2.    */
-	/* Tier 2: any active idle CPU in the mask. */
+	/* Look next for any active idle CPU in the mask. */
 	for_each_cpu(c, p->cpus_ptr) {
 		if (c < nr_cpu_ids && cpu_active(c) &&
 		    available_idle_cpu(c))
@@ -490,19 +490,20 @@ static bool std_dl_veto(struct task_struct *p, int cpu)
 }
 
 /*
- * Steer a wakeup toward idle capacity with a compact predictor.
+ * Move a wakeup toward idle capacity with a small predictor.
  *
- * Guards progress in code order: std_running, small-system pause
- * below three online CPUs, stop, pinned single-CPU tasks, migrating
- * tasks, rq-wide core check that may over-skip, then extensible
- * tasks remaining with SCX. Past the guards, deadline tasks respect
- * a laxity veto before consulting the predictor; real-time tasks
- * accept only idle destinations; fair tasks consult the predictor;
- * idle tasks remain in place. Predictor verdicts tally through
- * nn_keep and nn_migrate, placements through fastpath, steered and
- * fallback, and core-sharing picks through split_core. History
- * advances after prediction, preserving past placements alone,
- * using integer arithmetic in preallocated non-sleeping context.
+ * Guards run in code order. The switch comes first with a pause
+ * below three online CPUs. Stop tasks pass next with pinned
+ * single-CPU tasks and migrating tasks. The rq-wide core check may
+ * over-skip and extensible tasks stay with SCX. Past the guards,
+ * deadline tasks respect a laxity veto before asking the predictor
+ * and real-time tasks take only idle destinations. Fair tasks ask
+ * the predictor and idle tasks stay put. Votes tally through
+ * nn_keep and nn_migrate with placements through fastpath and
+ * steered and fallback and core-sharing picks through split_core.
+ * History grows after prediction so only past placements feed the
+ * next vote. All work uses integer math in preallocated
+ * non-sleeping context.
  */
 int std_select_cpu(struct task_struct *p, int cpu)
 {
@@ -529,10 +530,10 @@ int std_select_cpu(struct task_struct *p, int cpu)
 		return cpu;
 
 	/*
-	 * Core check is rq-wide and may over-skip: tasks on a core-scheduled
-	 * runqueue must stay together. Peek at the destination runqueue:
-	 * select_task_rq runs with the task pi_lock held, so this is a
-	 * benign racy read that only ever skips steering.
+	 * The core check is rq-wide and may over-skip. Tasks on a
+	 * core-scheduled runqueue must stay together. Peek at the
+	 * destination runqueue. select_task_rq runs with the task pi_lock
+	 * held, so this is a benign racy read that only ever skips moves.
 	 */
 	if (sched_core_enabled(cpu_rq(cpu)))
 		return cpu;

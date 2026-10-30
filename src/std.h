@@ -1,17 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Smart Task Distributor (STD) routing shim.
+ * Smart Task Distributor (STD) wakeup helper.
  *
- * STD refines wakeup placement chosen by the existing scheduler
- * classes. A tiny fixed-point predictor guides fair tasks toward
- * idle capacity; real-time tasks accept only idle destinations,
- * deadline tasks observe a laxity veto, and idle tasks stay put.
- * Candidates come from the task allowed mask, preferring a fully
- * idle core, then any idle CPU, then a spread fallback, always
- * respecting affinity with fallback to the class-selected CPU.
- * Extensible tasks remain with SCX; the core check is rq-wide and
- * may over-skip. Below three online CPUs steering stays off.
- * Counters appear as a vertical metric|value table with SI-1000 scaling.
+ * STD looks at the CPU picked at wakeup and may move the task
+ * toward idle capacity. A tiny fixed predictor votes for fair
+ * tasks. Real-time tasks move only to an idle CPU. Deadline
+ * tasks stay when laxity is low. Idle tasks never move. The new
+ * CPU always comes from the allowed mask and the old pick is kept
+ * when nothing fits. Tasks for SCX stay with SCX. Steering rests
+ * on tiny systems. Counts show in a small vertical table.
  */
 #ifndef _KERNEL_SCHED_STD_H
 #define _KERNEL_SCHED_STD_H
@@ -24,16 +21,17 @@
 
 #ifdef CONFIG_SMART_TASK_DISTRIBUTOR
 /*
- * Master switch: 1 steers wakeups by default, 0 retains class choices
- * at near-zero cost. Values clamp 0-1 through sysctl minmax and the
- * std_running= boot parameter accepting plain 0 or 1 alone.
+ * Master switch for wakeup moves. It starts at 1 so moves apply
+ * right away. A value of 0 keeps the first pick at near-zero cost.
+ * Values stay within 0 and 1 through sysctl minmax and through the
+ * std_running boot option which takes only plain 0 or 1.
  */
 extern int std_running;
 /*
- * Compact predictor identity (constant, read-only) beside its decision
- * threshold (tunable through sysctl and the std_nn_thresh= boot
- * parameter). The s32 predictor verdict weighs against this mark;
- * raising the mark steadies placement against migration.
+ * Predictor identity and its decision mark. The identity is a
+ * read-only constant. The mark is tunable through sysctl and through
+ * the std_nn_thresh boot option. The s32 vote is weighed against the
+ * mark and higher marks move less often.
  */
 extern const int std_nn_version;
 extern int std_nn_thresh;
