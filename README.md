@@ -159,7 +159,7 @@ You can also use `cat /proc/sys/kernel/std_stats` to check whether STD works as 
 
 PRs are welcome if you want to help add support for other Linux distros. Use of AI to help with the PR is acceptable if you have tested each PR carefully, with added proofs in the PR, a good commit description of what each commit contains, and a good PR body.
 
-Low effort PRs with almost no care for the structure and writing style of the STD codebase will almost certainly be rejected. The `CONTRIBUTING.md` file with details on how to contribute to this project will be added after I consider this repo ready for the public to contribute.
+Low effort PRs with almost no care for the structure and writing style of the STD codebase will almost certainly be rejected. The `CONTRIBUTING.md` file with details on how to contribute to this project will be added after we consider this repo ready for the public to contribute.
 
 ## License
 
