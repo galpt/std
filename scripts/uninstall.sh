@@ -249,25 +249,9 @@ list_limine_confs() {
 	done
 }
 
-# Strip isolation tokens (mirrored without re-append): remove all
-# isolcpus=/nohz_full=/rcu_nocbs= (any value). Preserves order of the rest.
-# $1 = cmdline string. Idempotent; empty input yields empty output.
-strip_isolation_tokens() {
-	strip_in="${1:-}"
-	strip_out=""
-	# shellcheck disable=SC2086 # word-splitting of cmdline tokens is intentional (one token per word)
-	for strip_tok in ${strip_in}; do
-		case "${strip_tok}" in
-			isolcpus=*|nohz_full=*|rcu_nocbs=*) continue ;;
-			*) strip_out="${strip_out:+${strip_out} }${strip_tok}" ;;
-		esac
-	done
-	printf '%s' "${strip_out}"
-}
-
 # Expected STD dirt allowlist (status parity with install.sh).
-# Membership allowlist: any subset of the 5 tracked STD modifications + any
-# subset of the 2 untracked STD sources is expected (subset acceptance);
+# Membership allowlist: any subset of the 6 tracked STD modifications + any
+# subset of the 3 untracked STD sources is expected (subset acceptance);
 # patch/build leftovers (*.orig/*.rej, kernel/sched/std.o, .std.o.cmd)
 # are ignored; anything else reports as extra dirt (read-only here).
 # Read-only; git only, never sudo, never mutates.
@@ -276,7 +260,7 @@ TREE_DIRT="unknown"
 
 is_expected_modified() {
 	case "$1" in
-		Documentation/admin-guide/kernel-parameters.txt|kernel/Kconfig.preempt|kernel/sched/Makefile|kernel/sched/sched.h|kernel/sched/core.c)
+		Documentation/admin-guide/kernel-parameters.txt|include/linux/sched.h|kernel/Kconfig.preempt|kernel/sched/Makefile|kernel/sched/sched.h|kernel/sched/core.c)
 			return 0
 			;;
 		*)
@@ -287,7 +271,7 @@ is_expected_modified() {
 
 is_expected_untracked() {
 	case "$1" in
-		kernel/sched/std.c|kernel/sched/std.h)
+		Documentation/scheduler/sched-std.rst|kernel/sched/std.c|kernel/sched/std.h)
 			return 0
 			;;
 		*)
@@ -400,7 +384,7 @@ classify_tree_dirt() {
 			[ -z "${eline}" ] && continue
 			echo "  extra: ${eline}"
 		done <<<"${extra_list}"
-		echo "  allowlist: up to 5M (Documentation/admin-guide/kernel-parameters.txt, kernel/Kconfig.preempt, kernel/sched/Makefile, kernel/sched/sched.h, kernel/sched/core.c) + up to 2U (kernel/sched/std.c, kernel/sched/std.h); any subset is expected; ignored: *.orig, *.rej, kernel/sched/std.o, kernel/sched/.std.o.cmd"
+		echo "  allowlist: up to 6M (Documentation/admin-guide/kernel-parameters.txt, include/linux/sched.h, kernel/Kconfig.preempt, kernel/sched/Makefile, kernel/sched/sched.h, kernel/sched/core.c) + up to 3U (Documentation/scheduler/sched-std.rst, kernel/sched/std.c, kernel/sched/std.h); any subset is expected; ignored: *.orig, *.rej, kernel/sched/std.o, kernel/sched/.std.o.cmd"
 		return 1
 	fi
 	if [ "${counted}" -eq 0 ]; then
@@ -409,7 +393,7 @@ classify_tree_dirt() {
 		return 0
 	fi
 	TREE_DIRT="expected"
-	echo "  dirt: expected STD dirt only (membership allowlist up to 5M+2U, any subset; ignored artifacts excluded)"
+	echo "  dirt: expected STD dirt only (membership allowlist up to 6M+3U, any subset; ignored artifacts excluded)"
 	return 0
 }
 
@@ -467,7 +451,7 @@ uninstall_status() {
 		# List stale dirty siblings without deleting (prune via --remove).
 		case "${krel}" in
 			7.3.0-std-dirty)
-				echo "  naming: ${krel} accepted with expected STD dirt only (membership allowlist up to 5M+2U, any subset); extra/unknown dirt or *+ still fails install verification."
+				echo "  naming: ${krel} accepted with expected STD dirt only (membership allowlist up to 6M+3U, any subset); extra/unknown dirt or *+ still fails install verification."
 				;;
 			*-dirty|*+)
 				echo "  naming: ${krel} carries a dirty/plus suffix; install verification fails (only 7.3.0-std-dirty with expected dirt verifies)."
@@ -512,10 +496,7 @@ uninstall_status() {
 # Retains tool phase for nested //std only (no tool for standalone stanza).
 # Removes nested //std (//std + kernel-id=std), legacy EOF (# STD + :STD +
 # UPPERCASE), orphan uppercase PROTOCOL:/CMDLINE: pairs, and the /STD kernel
-# stanza matching ver. Defensive post-filter strips residual isolation tokens
-# (isolcpus=/nohz_full=/rcu_nocbs= any value) file-wide via
-# strip_isolation_tokens so remove restores zero; primary removal stays the
-# STD stanza delete. Backup timestamped via sudo -n cp -a, b2sum pre/post,
+# stanza matching ver. Primary removal is the STD stanza delete. Backup timestamped via sudo -n cp -a, b2sum pre/post,
 # same-line absence verify (canonical /STD kernel (ver) and legacy :STD ver
 # must both be absent), rollback on fail. Keeps 4-candidate search, is_safe_ver,
 # BOOT_DIR confinement, sudo -n only. DRY_RUN/STATUS never mutate. Preserves
@@ -621,65 +602,6 @@ remove_limine_entry() {
 			echo "WARNING: cannot filter ${limine_conf}; restoring backup." >&2
 			sudo -n cp -a -- "${backup}" "${limine_conf}" || echo "WARNING: Limine rollback failed; restore ${backup} manually." >&2
 			rm -f -- "${tmpfile}" "${tmpfilt}" 2>/dev/null || true
-			filter_failed=1
-			continue
-		fi
-		# Defensive post-filter (primary removal is the STD stanza delete above):
-		# strip residual isolation tokens file-wide so remove restores zero.
-		# Preserves root/rootflags/MODESET order; only cmdline/CMDLINE values
-		# are rewritten, default_entry untouched (verified below).
-		tmpstripped="${tmpfilt}.stripped"
-		strip_line=""
-		strip_trimmed=""
-		strip_prefix=""
-		strip_val=""
-		strip_cleaned=""
-		if ! {
-			while IFS= read -r strip_line || [ -n "${strip_line}" ]; do
-				strip_trimmed="${strip_line#"${strip_line%%[![:space:]]*}"}"
-				case "${strip_trimmed}" in
-					cmdline:*)
-						strip_prefix="${strip_line%%cmdline:*}cmdline:"
-						strip_val="${strip_line#*cmdline:}"
-						if strip_cleaned="$(strip_isolation_tokens "${strip_val}")"; then
-							if [ -z "${strip_cleaned}" ]; then
-								printf '%s\n' "${strip_prefix}"
-							else
-								printf '%s %s\n' "${strip_prefix}" "${strip_cleaned}"
-							fi
-						else
-							printf '%s\n' "${strip_line}"
-						fi
-						;;
-					CMDLINE:*)
-						strip_prefix="${strip_line%%CMDLINE:*}CMDLINE:"
-						strip_val="${strip_line#*CMDLINE:}"
-						if strip_cleaned="$(strip_isolation_tokens "${strip_val}")"; then
-							if [ -z "${strip_cleaned}" ]; then
-								printf '%s\n' "${strip_prefix}"
-							else
-								printf '%s %s\n' "${strip_prefix}" "${strip_cleaned}"
-							fi
-						else
-							printf '%s\n' "${strip_line}"
-						fi
-						;;
-					*)
-						printf '%s\n' "${strip_line}"
-						;;
-				esac
-			done <"${tmpfilt}" >"${tmpstripped}"
-		}; then
-			echo "WARNING: cannot strip isolation tokens for ${limine_conf}; restoring backup." >&2
-			sudo -n cp -a -- "${backup}" "${limine_conf}" || echo "WARNING: Limine rollback failed; restore ${backup} manually." >&2
-			rm -f -- "${tmpfile}" "${tmpfilt}" "${tmpstripped}" 2>/dev/null || true
-			filter_failed=1
-			continue
-		fi
-		if ! mv -- "${tmpstripped}" "${tmpfilt}"; then
-			echo "WARNING: cannot apply isolation strip for ${limine_conf}; restoring backup." >&2
-			sudo -n cp -a -- "${backup}" "${limine_conf}" || echo "WARNING: Limine rollback failed; restore ${backup} manually." >&2
-			rm -f -- "${tmpfile}" "${tmpfilt}" "${tmpstripped}" 2>/dev/null || true
 			filter_failed=1
 			continue
 		fi
@@ -1035,11 +957,11 @@ while IFS= read -r patch; do
 	if [ -f "${CHECKPATCH}" ] && command -v perl >/dev/null 2>&1; then
 		# stdin (- < file) avoids git_is_single_file file-mode: a tracked
 		# patch passed as argv would diff -u /dev/null and flag patch
-		# formatting as errors. --ignore FILE_PATH_CHANGES scoped to 0003 only
-		# (0003 adds kernel/sched/std.c/std.h by design; MAINTAINERS update N/A).
+		# formatting as errors. --ignore FILE_PATH_CHANGES scoped to 0003/0005
+		# (0003 adds kernel/sched/std.c/std.h and 0005 adds sched-std.rst by design; MAINTAINERS update N/A).
 		CHECKPATCH_IGNORE=""
 		case "${patch}" in
-			0003-*) CHECKPATCH_IGNORE="--ignore FILE_PATH_CHANGES" ;;
+			0003-*|0005-*) CHECKPATCH_IGNORE="--ignore FILE_PATH_CHANGES" ;;
 		esac
 		# shellcheck disable=SC2086 # CHECKPATCH_IGNORE is empty or one allowlisted flag.
 		if ! perl "${CHECKPATCH}" --strict --no-tree ${CHECKPATCH_IGNORE} - < "${PATCH_FILE}" >/dev/null 2>&1; then

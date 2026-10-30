@@ -506,7 +506,7 @@ report_status() {
 			if [ "${ALLOW_DIRTY_SUPPRESS}" -eq 1 ]; then
 				echo "  naming: ${krel} carries a dirty suffix even with suppression preview; install would fail unless suppression pins AUTO=n." >&2
 			else
-				echo "  naming: ${krel} accepted when dirt is expected STD only (membership allowlist up to 5M+2U, any subset); extra/unknown dirt or *+ still fails (see dirt line below)."
+				echo "  naming: ${krel} accepted when dirt is expected STD only (membership allowlist up to 6M+3U, any subset); extra/unknown dirt or *+ still fails (see dirt line below)."
 			fi
 			;;
 		*-dirty|*+)
@@ -921,360 +921,6 @@ validate_modeset_opts() {
 	done
 }
 
-# STD CPU isolation helpers: cpulist validation + SMT-aware derivation.
-# Valid cpulist: 8-15, 0,2,4-7, etc. Format check only (no bounds here).
-# Newline/tab/space/control pre-reject before grep: grep -E ^...$ matches
-# per line, so an embedded newline ("8-15\nbad") would otherwise pass.
-# The shell case fails closed on any char outside [0-9,-] (covers space,
-# tab, newline and controls), then grep re-validates the full cpulist.
-is_valid_cpulist() {
-	valid_list="${1:-}"
-	if [ -z "${valid_list}" ]; then
-		return 1
-	fi
-	case "${valid_list}" in
-		*[!0-9,-]*) return 1 ;;
-	esac
-	if ! printf '%s' "${valid_list}" | grep -Eq '^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$'; then
-		return 1
-	fi
-	return 0
-}
-
-# Expand a cpulist (e.g. 0-1,8) to one CPU id per line. Returns 1 on bad input.
-iso_expand_one() {
-	iso_part="${1:-}"
-	case "${iso_part}" in
-		*-*)
-			iso_s="${iso_part%%-*}"
-			iso_e="${iso_part##*-}"
-			case "${iso_s}${iso_e}" in
-				''|*[!0-9]*) return 1 ;;
-			esac
-			if [ "${iso_s}" -gt "${iso_e}" ]; then
-				return 1
-			fi
-			iso_i="${iso_s}"
-			while [ "${iso_i}" -le "${iso_e}" ]; do
-				printf '%s\n' "${iso_i}"
-				iso_i=$(( iso_i + 1 ))
-			done
-			;;
-		*)
-			case "${iso_part}" in
-				''|*[!0-9]*) return 1 ;;
-			esac
-			printf '%s\n' "${iso_part}"
-			;;
-	esac
-}
-
-iso_expand_cpulist() {
-	iso_in_list="${1:-}"
-	iso_sp="$(printf '%s' "${iso_in_list}" | tr ',' ' ')"
-	# shellcheck disable=SC2086 # word-splitting on space-converted commas is intentional
-	for iso_p in ${iso_sp}; do
-		if ! iso_expand_one "${iso_p}"; then
-			return 1
-		fi
-	done
-}
-
-# STD CPU isolation range: whole SMT cores from the top until >= N/2.
-# Enumerates thread_siblings_list under the topology dir, dedupes core
-# groups, sorts by min-id, accumulates whole cores from the top (largest
-# min-id first) until the CPU sum reaches ceil(N/2), emits a compressed
-# cpulist (8-15 when contiguous, else comma list e.g. 2-3,6-7).
-# Falls back to legacy N/2..N-1 with a stderr warning when topology is
-# missing/unreadable. N from $1 (numeric) else nproc/getconf; topology
-# dir from $2 else ${STD_TOPOLOGY_DIR:-/sys/devices/system/cpu}. A single
-# $1 containing '/' is treated as the topology dir with N derived (topo
-# count when available, else nproc). Regex + bounds validated.
-# Out-of-range sibling IDs (>= N) are skipped (ignored) during group
-# accumulation, not a failure; a final compressed range containing an
-# out-of-range CPU fails the SMT path and falls back to legacy N/2..N-1.
-derive_isolation_range() {
-	iso_arg1="${1:-}"
-	iso_arg2="${2:-}"
-	iso_ncpus=""
-	iso_topo=""
-	if [ $# -ge 2 ]; then
-		iso_ncpus="${iso_arg1}"
-		iso_topo="${iso_arg2}"
-	elif [ $# -eq 1 ]; then
-		case "${iso_arg1}" in
-			*/*)
-				iso_topo="${iso_arg1}"
-				;;
-			*)
-				iso_ncpus="${iso_arg1}"
-				;;
-		esac
-	fi
-	if [ -z "${iso_topo}" ]; then
-		iso_topo="${STD_TOPOLOGY_DIR:-/sys/devices/system/cpu}"
-	fi
-	if [ -z "${iso_ncpus}" ]; then
-		iso_count=0
-		if [ -d "${iso_topo}" ]; then
-			for iso_d in "${iso_topo}"/cpu[0-9]*; do
-				[ -d "${iso_d}" ] || continue
-				iso_count=$(( iso_count + 1 ))
-			done
-		fi
-		if [ "${iso_count}" -ge 2 ]; then
-			iso_ncpus="${iso_count}"
-		else
-			if command -v nproc >/dev/null 2>&1; then
-				iso_ncpus="$(nproc 2>/dev/null || true)"
-			fi
-			if [ -z "${iso_ncpus}" ] && command -v getconf >/dev/null 2>&1; then
-				iso_ncpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
-			fi
-		fi
-	fi
-	iso_ncpus="$(printf '%s' "${iso_ncpus}" | tr -d '[:space:]' 2>/dev/null || printf '%s' "${iso_ncpus}")"
-	if ! printf '%s' "${iso_ncpus}" | grep -Eq '^[0-9]+$'; then
-		echo "derive_isolation_range: invalid CPU count: ${iso_ncpus}" >&2
-		return 1
-	fi
-	if [ "${iso_ncpus}" -lt 2 ]; then
-		echo "derive_isolation_range: CPU count ${iso_ncpus} too small for isolation" >&2
-		return 1
-	fi
-	iso_legacy_start=$(( iso_ncpus / 2 ))
-	iso_legacy_end=$(( iso_ncpus - 1 ))
-	iso_legacy="${iso_legacy_start}-${iso_legacy_end}"
-	iso_smt_ok=1
-	if [ -z "${iso_topo}" ] || [ ! -d "${iso_topo}" ]; then
-		iso_smt_ok=0
-	else
-		iso_i=0
-		while [ "${iso_i}" -lt "${iso_ncpus}" ]; do
-			if [ ! -r "${iso_topo}/cpu${iso_i}/topology/thread_siblings_list" ]; then
-				iso_smt_ok=0
-				break
-			fi
-			iso_i=$(( iso_i + 1 ))
-		done
-	fi
-	if [ "${iso_smt_ok}" -eq 1 ]; then
-		iso_tmp="$(mktemp /tmp/std-iso-XXXXXX 2>/dev/null || true)"
-		if [ -z "${iso_tmp}" ]; then
-			iso_smt_ok=0
-		else
-			iso_uniq="${iso_tmp}.uniq"
-			iso_groups="${iso_tmp}.groups"
-			iso_sel="${iso_tmp}.sel"
-			: >"${iso_tmp}" 2>/dev/null || iso_smt_ok=0
-			: >"${iso_uniq}" 2>/dev/null || iso_smt_ok=0
-			: >"${iso_groups}" 2>/dev/null || iso_smt_ok=0
-			: >"${iso_sel}" 2>/dev/null || iso_smt_ok=0
-		fi
-	fi
-	if [ "${iso_smt_ok}" -eq 1 ]; then
-		iso_i=0
-		while [ "${iso_i}" -lt "${iso_ncpus}" ]; do
-			iso_file="${iso_topo}/cpu${iso_i}/topology/thread_siblings_list"
-			iso_raw="$(cat -- "${iso_file}" 2>/dev/null | tr -d '[:space:]' || true)"
-			if [ -z "${iso_raw}" ]; then
-				iso_smt_ok=0
-				break
-			fi
-			if ! is_valid_cpulist "${iso_raw}"; then
-				iso_smt_ok=0
-				break
-			fi
-			printf '%s\n' "${iso_raw}" >>"${iso_tmp}" 2>/dev/null || { iso_smt_ok=0; break; }
-			iso_i=$(( iso_i + 1 ))
-		done
-	fi
-	if [ "${iso_smt_ok}" -eq 1 ]; then
-		if ! sort -u -- "${iso_tmp}" >"${iso_uniq}" 2>/dev/null; then
-			iso_smt_ok=0
-		elif [ ! -s "${iso_uniq}" ]; then
-			iso_smt_ok=0
-		fi
-	fi
-	if [ "${iso_smt_ok}" -eq 1 ]; then
-		while IFS= read -r iso_grp || [ -n "${iso_grp}" ]; do
-			[ -z "${iso_grp}" ] && continue
-			iso_ids="$(iso_expand_cpulist "${iso_grp}" 2>/dev/null | sort -n -u || true)"
-			if [ -z "${iso_ids}" ]; then
-				iso_smt_ok=0
-				break
-			fi
-			iso_min=""
-			iso_cnt=0
-			while IFS= read -r iso_c || [ -n "${iso_c}" ]; do
-				[ -z "${iso_c}" ] && continue
-				case "${iso_c}" in
-					''|*[!0-9]*) iso_smt_ok=0; break 2 ;;
-				esac
-				# Out-of-range skip (not fail): sibling IDs >= N are ignored
-				# here; a final range containing one fails the SMT path below
-				# and falls back to legacy.
-				if [ "${iso_c}" -ge "${iso_ncpus}" ]; then
-					continue
-				fi
-				if [ -z "${iso_min}" ] || [ "${iso_c}" -lt "${iso_min}" ]; then
-					iso_min="${iso_c}"
-				fi
-				iso_cnt=$(( iso_cnt + 1 ))
-			done <<<"${iso_ids}"
-			if [ "${iso_smt_ok}" -eq 0 ]; then
-				break
-			fi
-			if [ -z "${iso_min}" ] || [ "${iso_cnt}" -eq 0 ]; then
-				continue
-			fi
-			printf '%s %s %s\n' "${iso_min}" "${iso_cnt}" "${iso_grp}" >>"${iso_groups}" 2>/dev/null || { iso_smt_ok=0; break; }
-		done <"${iso_uniq}"
-		if [ ! -s "${iso_groups}" ]; then
-			iso_smt_ok=0
-		fi
-	fi
-	iso_range=""
-	if [ "${iso_smt_ok}" -eq 1 ]; then
-		iso_need=$(( (iso_ncpus + 1) / 2 ))
-		iso_sum=0
-		: >"${iso_sel}" 2>/dev/null || iso_smt_ok=0
-		if [ "${iso_smt_ok}" -eq 1 ]; then
-			if ! sort -nr -- "${iso_groups}" >"${iso_groups}.sorted" 2>/dev/null; then
-				iso_smt_ok=0
-			else
-				mv -- "${iso_groups}.sorted" "${iso_groups}" 2>/dev/null || iso_smt_ok=0
-			fi
-		fi
-		if [ "${iso_smt_ok}" -eq 1 ]; then
-			while IFS= read -r iso_line || [ -n "${iso_line}" ]; do
-				[ -z "${iso_line}" ] && continue
-				# shellcheck disable=SC2086 # word-splitting of "min size group" is intentional
-				set -- ${iso_line}
-				iso_gmin="$1"
-				iso_gsz="$2"
-				iso_ggrp="$3"
-				if [ -z "${iso_gmin}" ] || [ -z "${iso_gsz}" ] || [ -z "${iso_ggrp}" ]; then
-					iso_smt_ok=0
-					break
-				fi
-				printf '%s\n' "${iso_ggrp}" >>"${iso_sel}" 2>/dev/null || { iso_smt_ok=0; break; }
-				iso_sum=$(( iso_sum + iso_gsz ))
-				if [ "${iso_sum}" -ge "${iso_need}" ]; then
-					break
-				fi
-			done <"${iso_groups}"
-		fi
-		if [ "${iso_smt_ok}" -eq 1 ]; then
-			iso_all_ids=""
-			while IFS= read -r iso_sg || [ -n "${iso_sg}" ]; do
-				[ -z "${iso_sg}" ] && continue
-				iso_e="$(iso_expand_cpulist "${iso_sg}" 2>/dev/null || true)"
-				if [ -z "${iso_e}" ]; then
-					iso_smt_ok=0
-					break
-				fi
-				iso_all_ids="${iso_all_ids:+${iso_all_ids}
-}${iso_e}"
-			done <"${iso_sel}"
-		fi
-		if [ "${iso_smt_ok}" -eq 1 ]; then
-			iso_final_sorted="$(printf '%s\n' "${iso_all_ids}" | sort -n -u 2>/dev/null | awk -v n="${iso_ncpus}" '$1 < n' || true)"
-			if [ -z "${iso_final_sorted}" ]; then
-				iso_smt_ok=0
-			else
-				iso_range="$(printf '%s\n' "${iso_final_sorted}" | awk 'NR==1{ s=$1; p=$1; next } { if($1==p+1){ p=$1 } else { if(s==p) printf "%s%s", sep, s; else printf "%s%s-%s", sep, s, p; sep=","; s=$1; p=$1 } } END{ if(s!=""){ if(s==p) printf "%s%s", sep, s; else printf "%s%s-%s", sep, s, p } }' 2>/dev/null || true)"
-				if [ -z "${iso_range}" ]; then
-					iso_smt_ok=0
-				elif ! is_valid_cpulist "${iso_range}"; then
-					iso_smt_ok=0
-				else
-					iso_chk="$(iso_expand_cpulist "${iso_range}" 2>/dev/null || true)"
-					iso_bad=0
-					while IFS= read -r iso_c || [ -n "${iso_c}" ]; do
-						[ -z "${iso_c}" ] && continue
-						if [ "${iso_c}" -ge "${iso_ncpus}" ]; then
-							iso_bad=1
-							break
-						fi
-					done <<<"${iso_chk}"
-					if [ "${iso_bad}" -ne 0 ]; then
-						iso_smt_ok=0
-					fi
-				fi
-			fi
-		fi
-		rm -f -- "${iso_tmp}" "${iso_uniq}" "${iso_groups}" "${iso_sel}" 2>/dev/null || true
-	fi
-	if [ "${iso_smt_ok}" -eq 1 ] && [ -n "${iso_range}" ]; then
-		printf '%s' "${iso_range}"
-		return 0
-	fi
-	rm -f -- "${iso_tmp:-}" "${iso_tmp:-}.uniq" "${iso_tmp:-}.groups" "${iso_tmp:-}.sel" 2>/dev/null || true
-	echo "derive_isolation_range: SMT topology unavailable, falling back to legacy ${iso_legacy}" >&2
-	if ! is_valid_cpulist "${iso_legacy}"; then
-		echo "derive_isolation_range: invalid legacy range: ${iso_legacy}" >&2
-		return 1
-	fi
-	printf '%s' "${iso_legacy}"
-}
-
-# Normalize cmdline isolation tokens: strip all isolcpus=/nohz_full=/rcu_nocbs=
-# (any value), dedupe, append canonical three once in fixed order, idempotent.
-# Preserves order of remaining tokens (root/rootflags/MODESET untouched).
-# $1 = cmdline, $2 = cpulist (optional; derived when empty). Accepts cpulist
-# (8-15 contiguous or comma list e.g. 2-3,6-7); each range must have
-# start <= end and numeric CPUs.
-normalize_isolation_cmdline() {
-	norm_in="${1:-}"
-	norm_range="${2:-}"
-	if [ -z "${norm_range}" ]; then
-		if ! norm_range="$(derive_isolation_range)"; then
-			echo "normalize_isolation_cmdline: cannot derive isolation range" >&2
-			return 1
-		fi
-	fi
-	if ! is_valid_cpulist "${norm_range}"; then
-		echo "normalize_isolation_cmdline: refusing unsafe range: ${norm_range}" >&2
-		return 1
-	fi
-	norm_sp="$(printf '%s' "${norm_range}" | tr ',' ' ')"
-	# shellcheck disable=SC2086 # word-splitting on space-converted commas is intentional
-	for norm_part in ${norm_sp}; do
-		case "${norm_part}" in
-			*-*)
-				norm_s="${norm_part%%-*}"
-				norm_e="${norm_part##*-}"
-				case "${norm_s}${norm_e}" in
-					''|*[!0-9]*) echo "normalize_isolation_cmdline: refusing unsafe range: ${norm_range}" >&2; return 1 ;;
-				esac
-				if [ "${norm_s}" -gt "${norm_e}" ]; then
-					echo "normalize_isolation_cmdline: refusing inverted range: ${norm_range}" >&2
-					return 1
-				fi
-				;;
-			*)
-				case "${norm_part}" in
-					''|*[!0-9]*) echo "normalize_isolation_cmdline: refusing unsafe range: ${norm_range}" >&2; return 1 ;;
-				esac
-				;;
-		esac
-	done
-	norm_out=""
-	# shellcheck disable=SC2086 # word-splitting of cmdline tokens is intentional (one token per word)
-	for norm_tok in ${norm_in}; do
-		case "${norm_tok}" in
-			isolcpus=*|nohz_full=*|rcu_nocbs=*) continue ;;
-			*) norm_out="${norm_out:+${norm_out} }${norm_tok}" ;;
-		esac
-	done
-	if [ -z "${norm_out}" ]; then
-		norm_out="isolcpus=${norm_range} nohz_full=${norm_range} rcu_nocbs=${norm_range}"
-	else
-		norm_out="${norm_out} isolcpus=${norm_range} nohz_full=${norm_range} rcu_nocbs=${norm_range}"
-	fi
-	printf '%s' "${norm_out}"
-}
 
 # Audit modprobe.d for NVIDIA modeset persistence (read-only; never mutates).
 # Checks /etc/modprobe.d, /lib/modprobe.d, /usr/lib/modprobe.d for
@@ -1828,35 +1474,8 @@ EOF
 			std_cmdline="quiet splash rw"
 		fi
 	fi
-	# STD isolation: normalize (strip any value, dedupe, append canonical three
-	# fixed order, idempotent). Preserves root/rootflags/MODESET order.
-	# Wired after MODESET_OPTS wiring, before tmpcmd write.
-	if isol_range="$(derive_isolation_range)"; then
-		if ! std_cmdline="$(normalize_isolation_cmdline "${std_cmdline}" "${isol_range}")"; then
-			echo "WARNING: isolation normalize failed; keeping cmdline without canonical isolation." >&2
-		else
-			echo "Wiring isolation into Limine cmdline: isolcpus=${isol_range} nohz_full=${isol_range} rcu_nocbs=${isol_range}"
-		fi
-	else
-		echo "WARNING: cannot derive isolation range; keeping cmdline without isolation." >&2
-		isol_range=""
-	fi
 	printf '%s' "${std_cmdline}" >"${tmpcmd}" 2>/dev/null || true
 	std_cmdline="$(cat -- "${tmpcmd}" 2>/dev/null || true)"
-	# Isolation-aware idempotency: existing STD cmdline must already equal its
-	# normalized form (catches wrong range, duplicates, missing tokens).
-	need_isol_rewrite=0
-	if [ -n "${isol_range:-}" ]; then
-		std_existing_isol="$(awk -v ver="${target_ver}" 'index($0, "/STD kernel (" ver ")")>0 { in_std=1; next } /^\// { if (in_std) in_std=0 } in_std && /^[[:space:]]*cmdline:/ { sub(/^[[:space:]]*cmdline:[[:space:]]*/, ""); print; exit }' "${tmpfile}" 2>/dev/null || true)"
-		if [ -n "${std_existing_isol}" ]; then
-			if std_norm_check="$(normalize_isolation_cmdline "${std_existing_isol}" "${isol_range}" 2>/dev/null)"; then
-				if [ "${std_existing_isol}" != "${std_norm_check}" ]; then
-					need_isol_rewrite=1
-					echo "Limine STD entry isolation mismatch (wrong/missing/duplicate); will rewrite with ${isol_range}."
-				fi
-			fi
-		fi
-	fi
 	canon_count="$(grep -F -- "/STD kernel (${target_ver})" "${tmpfile}" 2>/dev/null | grep -F -c -- "(${target_ver})" || true)"
 	case "${canon_count}" in ''|*[!0-9]*) canon_count=0 ;; esac
 	has_nested=0
@@ -1871,26 +1490,39 @@ EOF
 	if grep -Eq -- '^[[:space:]]*(PROTOCOL|KERNEL_PATH|MODULE_PATH|CMDLINE):' "${tmpfile}" 2>/dev/null; then
 		has_upper=1
 	fi
-	if [ "${canon_count}" -eq 1 ] && [ "${has_nested}" -eq 0 ] && [ "${has_legacy}" -eq 0 ] && [ "${has_upper}" -eq 0 ] && [ "${need_isol_rewrite:-0}" -eq 0 ]; then
-		kpp_check="$(grep -n -F -- "/Devario KPP kernel" "${tmpfile}" 2>/dev/null | grep -F -- "(fallback)" | cut -d: -f1 | head -n 1 || true)"
-		if [ -z "${kpp_check}" ]; then
-			echo "Limine entry already present (/STD kernel ${target_ver} positioned, no remnants)."
-			rm -f -- "${tmpfile}" "${tmpfilt}" "${tmpnew}" "${tmpstanza}" "${tmpcmd}" 2>/dev/null || true
-			return 0
-		fi
-		canon_line="$(grep -n -F -- "/STD kernel (${target_ver})" "${tmpfile}" 2>/dev/null | cut -d: -f1 | head -n 1 || true)"
-		kpp_end="$(awk -v s="${kpp_check}" 'NR>s { if ($0 ~ /^$/ || $0 ~ /^\//) { print NR; exit } }' "${tmpfile}" 2>/dev/null || true)"
-		if [ -z "${kpp_end}" ]; then
-			kpp_end="$(wc -l < "${tmpfile}" 2>/dev/null | tr -d ' ' || echo 0)"
-			case "${kpp_end}" in ''|*[!0-9]*) kpp_end=0 ;; esac
-		fi
-		if [ -n "${canon_line}" ]; then
-			case "${canon_line}" in ''|*[!0-9]*) canon_line=0 ;; esac
-			case "${kpp_end}" in ''|*[!0-9]*) kpp_end=0 ;; esac
-			if [ "${canon_line}" -gt "${kpp_end}" ]; then
-				echo "Limine entry already present (/STD kernel ${target_ver} positioned after KPP fallback, no remnants)."
+	if [ "${canon_count}" -eq 1 ] && [ "${has_nested}" -eq 0 ] && [ "${has_legacy}" -eq 0 ] && [ "${has_upper}" -eq 0 ]; then
+		# Idempotency requires cmdline equality, not just stanza presence:
+		# a stale STD entry (e.g. old isolcpus=8-15 trio) must NOT satisfy
+		# the early-return. Compare existing STD stanza cmdline against the
+		# desired std_cmdline (root UUID/rootflags + MODESET_OPTS, no trio)
+		# with whitespace normalization; on mismatch fall through to the
+		# dedupe + positioned-insert rewrite below.
+		existing_std_cmdline="$(awk -v ver="(${target_ver})" 'index($0, "/STD kernel")>0 && index($0, ver)>0 { in_std=1; next } in_std && /^[[:space:]]*cmdline:/ { sub(/^[[:space:]]*cmdline:[[:space:]]*/, ""); print; exit } in_std && /^\// { exit }' "${tmpfile}" 2>/dev/null || true)"
+		norm_existing="$(printf '%s' "${existing_std_cmdline}" | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//')"
+		norm_desired="$(printf '%s' "${std_cmdline}" | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//')"
+		if [ "${norm_existing}" != "${norm_desired}" ]; then
+			echo "Limine STD entry cmdline differs (existing vs desired); rewriting positioned entry..."
+		else
+			kpp_check="$(grep -n -F -- "/Devario KPP kernel" "${tmpfile}" 2>/dev/null | grep -F -- "(fallback)" | cut -d: -f1 | head -n 1 || true)"
+			if [ -z "${kpp_check}" ]; then
+				echo "Limine entry already present (/STD kernel ${target_ver} positioned, no remnants)."
 				rm -f -- "${tmpfile}" "${tmpfilt}" "${tmpnew}" "${tmpstanza}" "${tmpcmd}" 2>/dev/null || true
 				return 0
+			fi
+			canon_line="$(grep -n -F -- "/STD kernel (${target_ver})" "${tmpfile}" 2>/dev/null | cut -d: -f1 | head -n 1 || true)"
+			kpp_end="$(awk -v s="${kpp_check}" 'NR>s { if ($0 ~ /^$/ || $0 ~ /^\//) { print NR; exit } }' "${tmpfile}" 2>/dev/null || true)"
+			if [ -z "${kpp_end}" ]; then
+				kpp_end="$(wc -l < "${tmpfile}" 2>/dev/null | tr -d ' ' || echo 0)"
+				case "${kpp_end}" in ''|*[!0-9]*) kpp_end=0 ;; esac
+			fi
+			if [ -n "${canon_line}" ]; then
+				case "${canon_line}" in ''|*[!0-9]*) canon_line=0 ;; esac
+				case "${kpp_end}" in ''|*[!0-9]*) kpp_end=0 ;; esac
+				if [ "${canon_line}" -gt "${kpp_end}" ]; then
+					echo "Limine entry already present (/STD kernel ${target_ver} positioned after KPP fallback, no remnants)."
+					rm -f -- "${tmpfile}" "${tmpfilt}" "${tmpnew}" "${tmpstanza}" "${tmpcmd}" 2>/dev/null || true
+					return 0
+				fi
 			fi
 		fi
 	fi
@@ -2273,16 +1905,16 @@ pin_localversion() {
 }
 
 # Expected STD dirt allowlist (fail-closed on extra dirt).
-# Membership allowlist: any subset of the 5 tracked STD files + any subset
-# of the 2 untracked STD sources is expected (subset acceptance, not an
-# exact 7-file count). Patch/build leftovers are ignored, never counted.
+# Membership allowlist: any subset of the 6 tracked STD files + any subset
+# of the 3 untracked STD sources is expected (subset acceptance, not an
+# exact 9-file count). Patch/build leftovers are ignored, never counted.
 # Anything else is extra dirt and fails install verification.
 # Read-only; git only, never sudo, never mutates.
 TREE_DIRT="unknown"
 
 is_expected_modified() {
 	case "$1" in
-		Documentation/admin-guide/kernel-parameters.txt|kernel/Kconfig.preempt|kernel/sched/Makefile|kernel/sched/sched.h|kernel/sched/core.c)
+		Documentation/admin-guide/kernel-parameters.txt|include/linux/sched.h|kernel/Kconfig.preempt|kernel/sched/Makefile|kernel/sched/sched.h|kernel/sched/core.c)
 			return 0
 			;;
 		*)
@@ -2293,7 +1925,7 @@ is_expected_modified() {
 
 is_expected_untracked() {
 	case "$1" in
-		kernel/sched/std.c|kernel/sched/std.h)
+		Documentation/scheduler/sched-std.rst|kernel/sched/std.c|kernel/sched/std.h)
 			return 0
 			;;
 		*)
@@ -2319,8 +1951,8 @@ is_ignored_dirt() {
 # Classify working-tree dirt against the allowlist (read-only, no sudo).
 # Prints one `  dirt: ...` line plus any `  extra: ...` lines.
 # Sets TREE_DIRT to clean|expected|extra|unknown. Returns 0 unless extra.
-# Membership allowlist (any subset accepted): up to 5 tracked STD
-# modifications + up to 2 untracked STD sources; ignored artifacts excluded;
+# Membership allowlist (any subset accepted): up to 6 tracked STD
+# modifications + up to 3 untracked STD sources; ignored artifacts excluded;
 # extra fails.
 classify_tree_dirt() {
 	TREE_DIRT="unknown"
@@ -2409,7 +2041,7 @@ classify_tree_dirt() {
 			[ -z "${eline}" ] && continue
 			echo "  extra: ${eline}"
 		done <<<"${extra_list}"
-		echo "  allowlist: up to 5M (Documentation/admin-guide/kernel-parameters.txt, kernel/Kconfig.preempt, kernel/sched/Makefile, kernel/sched/sched.h, kernel/sched/core.c) + up to 2U (kernel/sched/std.c, kernel/sched/std.h); any subset is expected; ignored: *.orig, *.rej, kernel/sched/std.o, kernel/sched/.std.o.cmd"
+		echo "  allowlist: up to 6M (Documentation/admin-guide/kernel-parameters.txt, include/linux/sched.h, kernel/Kconfig.preempt, kernel/sched/Makefile, kernel/sched/sched.h, kernel/sched/core.c) + up to 3U (Documentation/scheduler/sched-std.rst, kernel/sched/std.c, kernel/sched/std.h); any subset is expected; ignored: *.orig, *.rej, kernel/sched/std.o, kernel/sched/.std.o.cmd"
 		return 1
 	fi
 	if [ "${counted}" -eq 0 ]; then
@@ -2418,7 +2050,7 @@ classify_tree_dirt() {
 		return 0
 	fi
 	TREE_DIRT="expected"
-	echo "  dirt: expected STD dirt only (membership allowlist up to 5M+2U, any subset; ignored artifacts excluded)"
+	echo "  dirt: expected STD dirt only (membership allowlist up to 6M+3U, any subset; ignored artifacts excluded)"
 	return 0
 }
 
@@ -2426,7 +2058,7 @@ classify_tree_dirt() {
 # Accepts 7.3.0-std (clean) and 7.3.0-std-dirty when TREE_DIRT==expected;
 # fail-closed on extra/unknown dirt, on *+ suffixes, and on bare 7.3.0-dirty.
 # Verifies -std pin, AUTO state matches the flag, tag prerequisite (v7.3),
-# expected-dirt membership allowlist (any subset up to 5M+2U, ignored artifacts excluded, extra fails),
+# expected-dirt membership allowlist (any subset up to 6M+3U, ignored artifacts excluded, extra fails),
 # and the clean contract (clean tree must yield exactly 7.3.0-std).
 # Called after olddefconfig + `make -s kernelrelease`; never auto-boots.
 # Live `make -s kernelrelease` is the source of truth; include/config/kernel.release
@@ -2470,7 +2102,7 @@ verify_kernelrelease() {
 			echo "WARNING: tree does not describe v7.3; clean contract expects a v7.3 checkout (clone --branch v7.3)." >&2
 		fi
 	fi
-	# Expected-dirt membership allowlist: any subset up to 5M + 2U accepted,
+	# Expected-dirt membership allowlist: any subset up to 6M + 3U accepted,
 	# ignored artifacts (*.orig/*.rej, kernel/sched/std.o, kernel/sched/.std.o.cmd) excluded,
 	# anything else fails (fail-closed). Runs before the *-dirty gate so
 	# extra dirt reports first; bare 7.3.0-dirty stays rejected above.
@@ -2489,13 +2121,13 @@ verify_kernelrelease() {
 				return 1
 			fi
 			if [ "${ver}" = "7.3.0-std-dirty" ] && [ "${TREE_DIRT}" = "expected" ]; then
-				echo "Expected-dirt verification: ${ver} OK (STD membership allowlist dirt up to 5M+2U, any subset, yields -dirty by design)."
+				echo "Expected-dirt verification: ${ver} OK (STD membership allowlist dirt up to 6M+3U, any subset, yields -dirty by design)."
 				return 0
 			fi
 			cat >&2 <<EOF
 ERROR: kernelrelease ${ver} carries a dirty suffix (fail-closed, dirt=${TREE_DIRT}).
 Clean contract: a clean v7.3 tree with CONFIG_LOCALVERSION="-std" and AUTO=y yields exactly 7.3.0-std.
-Expected STD dirt only (membership allowlist up to 5M+2U, any subset) yields 7.3.0-std-dirty and verifies OK; extra/unknown dirt and *+ suffixes fail.
+Expected STD dirt only (membership allowlist up to 6M+3U, any subset) yields 7.3.0-std-dirty and verifies OK; extra/unknown dirt and *+ suffixes fail.
 To proceed: commit STD inside ${KERNEL_DIR} for a clean tree, or rerun with explicit --allow-dirty-suppress (AUTO=n + LOCALVERSION="") to force 7.3.0-std.
 Prune old *-dirty boot/modules artifacts afterwards via: scripts/uninstall.sh --remove --yes [KERNEL_DIR].
 EOF
@@ -2515,7 +2147,7 @@ EOF
 		return 0
 	fi
 	if [ "${TREE_DIRT}" = "expected" ]; then
-		echo "Expected-dirt verification: ${ver} carries only STD membership allowlist dirt (any subset up to 5M+2U)."
+		echo "Expected-dirt verification: ${ver} carries only STD membership allowlist dirt (any subset up to 6M+3U)."
 	fi
 	echo "Kernel release verification: ${ver} OK (pin -std, AUTO checked, tag v7.3)."
 	return 0
@@ -2710,11 +2342,11 @@ while IFS= read -r patch; do
 	if [ -f "${CHECKPATCH}" ] && command -v perl >/dev/null 2>&1; then
 		# stdin (- < file) avoids git_is_single_file file-mode: a tracked
 		# patch passed as argv would diff -u /dev/null and flag patch
-		# formatting as errors. --ignore FILE_PATH_CHANGES scoped to 0003 only
-		# (0003 adds kernel/sched/std.c/std.h by design; MAINTAINERS update N/A).
+		# formatting as errors. --ignore FILE_PATH_CHANGES scoped to 0003/0005
+		# (0003 adds kernel/sched/std.c/std.h and 0005 adds sched-std.rst by design; MAINTAINERS update N/A).
 		CHECKPATCH_IGNORE=""
 		case "${patch}" in
-			0003-*) CHECKPATCH_IGNORE="--ignore FILE_PATH_CHANGES" ;;
+			0003-*|0005-*) CHECKPATCH_IGNORE="--ignore FILE_PATH_CHANGES" ;;
 		esac
 		# shellcheck disable=SC2086 # CHECKPATCH_IGNORE is empty or one allowlisted flag.
 		if ! perl "${CHECKPATCH}" --strict --no-tree ${CHECKPATCH_IGNORE} - < "${PATCH_FILE}" >/dev/null 2>&1; then
@@ -2744,7 +2376,7 @@ if [ "${DRY_RUN}" -eq 1 ]; then
 				if [ "${ALLOW_DIRTY_SUPPRESS}" -eq 1 ]; then
 					echo "Dry-run: ${DRY_KREL} carries a dirty suffix; install will pin AUTO=n + LOCALVERSION=\"\" to force 7.3.0-std."
 				else
-					echo "Dry-run: ${DRY_KREL} verifies OK when dirt is expected STD only (membership allowlist up to 5M+2U, any subset); extra/unknown dirt or *+ still fails install verification."
+					echo "Dry-run: ${DRY_KREL} verifies OK when dirt is expected STD only (membership allowlist up to 6M+3U, any subset); extra/unknown dirt or *+ still fails install verification."
 				fi
 				;;
 			*-dirty|*+)

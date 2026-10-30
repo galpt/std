@@ -1,41 +1,52 @@
-From b0a52b666c02bb3888406c1ced4a0b9f1ced Mon Sep 17 00:00:00 2001
+From e2d7a6ba3474724f6e18924cf09f31d052405f5f Mon Sep 17 00:00:00 2001
 From: Galih Tama <galpt@v.recipes>
-Date: Fri, 30 Oct 2026 11:30:00 +0700
-Subject: [PATCH 4/4] STD: hook select_task_rq Fair/Idle-only
+Date: Fri, 30 Oct 2026 13:15:32 +0700
+Subject: [PATCH 4/5] STD: hook select_task_rq and fork init
 
-Hook select_task_rq via std_select_cpu. Keeps Fair/Idle-only
-routing above deadline with no new class. Respects affinity and
-small-system guard; pinned, migrating, core (rq-wide, may
-over-skip) and EXT pass through, stop never intercepted, DL/RT
-pass through (SIS, no counters, LLC tier removed). Steers Fair/Idle
-with SMT-aware idle selection denying cross-group only when
-in-group allowed exists. Placement stays at wakeup time; the pick
-path is untouched so the disabled cost is near-zero.
+Hook select_task_rq through std_select_cpu while resetting per-task
+history in __sched_fork through std_init_hist. Placement refines the
+class choice toward idle capacity within existing classes, honoring
+affinity and pausing on small systems. Pinned, migrating, core
+(rq-wide, may over-skip) and extensible tasks retain their course;
+stop tasks stay untouched; deadline tasks meet a laxity veto,
+real-time tasks require idle destinations, fair tasks heed the
+predictor and idle tasks stay put. Steering acts at wakeup alone;
+the pick path stays untouched, leaving disabled cost near zero.
 
 Signed-off-by: Galih Tama <galpt@v.recipes>
 ---
- kernel/sched/core.c | 9 +++++++++
- 1 file changed, 9 insertions(+)
+ kernel/sched/core.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
 
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 1754d9f95..e5dba0588 100644
+index 1754d9f95..01fe12724 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
-@@ -3634,6 +3634,15 @@ int select_task_rq(struct task_struct *p, int cpu, int *wake_flags)
+@@ -3634,6 +3634,13 @@ int select_task_rq(struct task_struct *p, int cpu, int *wake_flags)
  
  	if (p->nr_cpus_allowed > 1 && !is_migration_disabled(p)) {
  		cpu = p->sched_class->select_task_rq(p, cpu, *wake_flags);
 +		/*
-+		 * STD Fair/Idle-only routing shim above deadline: SMT-aware
-+		 * idle selection for housekeeping, denying cross-group only
-+		 * when in-group allowed exists; honoring affinity; stop never
-+		 * intercepted, pinned/migrating/core(rq-wide, may
-+		 * over-skip)/EXT pass through; DL/RT pass through (SIS, no
-+		 * counters); LLC tier removed. Wakeup only; pick untouched.
++		 * STD refines the class choice toward idle capacity with a compact
++		 * predictor preferring a fully idle core, then any idle CPU, then
++		 * spread. Real-time requires idle, deadline a laxity veto, fair the
++		 * predictor, idle staying put. Wakeup alone; pick path untouched.
 +		 */
 +		cpu = std_select_cpu(p, cpu);
  		*wake_flags |= WF_RQ_SELECTED;
  	} else {
  		cpu = cpumask_any(p->cpus_ptr);
+@@ -4587,6 +4595,10 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
+ {
+ 	p->on_rq			= 0;
+ 
++#ifdef CONFIG_SMART_TASK_DISTRIBUTOR
++	std_init_hist(p);
++#endif
++
+ 	p->se.on_rq			= 0;
+ 	p->se.exec_start		= 0;
+ 	p->se.sum_exec_runtime		= 0;
 -- 
 2.56.0
+

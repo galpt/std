@@ -2,32 +2,45 @@
 /*
  * Smart Task Distributor (STD) routing shim.
  *
- * Fair/Idle-only shim above the deadline class with no new
- * scheduling class. Fair and idle tasks prefer housekeeping CPUs
- * with SMT-aware idle selection; deadline and real-time tasks pass
- * through to the class-selected (SIS) CPU with no counters.
- * Deny cross-group only when an in-group allowed CPU
- * exists, otherwise the original CPU is kept. Affinity is honored
- * with fallback to the class-selected CPU. Extensible tasks defer
- * to SCX; core check is rq-wide and may over-skip. Small systems
- * with fewer than three online CPUs stay off. Without
- * HK_TYPE_DOMAIN isolation all CPUs are housekeeping and the class
- * CPU is kept. LLC tier removed (SIS-deference); stats are a
- * vertical 2-column metric|value table.
+ * STD refines wakeup placement chosen by the existing scheduler
+ * classes. A tiny fixed-point predictor guides fair tasks toward
+ * idle capacity; real-time tasks accept only idle destinations,
+ * deadline tasks observe a laxity veto, and idle tasks stay put.
+ * Candidates come from the task allowed mask, preferring a fully
+ * idle core, then any idle CPU, then a spread fallback, always
+ * respecting affinity with fallback to the class-selected CPU.
+ * Extensible tasks remain with SCX; the core check is rq-wide and
+ * may over-skip. Below three online CPUs steering stays off.
+ * Counters appear as a vertical metric|value table with SI-1000 scaling.
  */
 #ifndef _KERNEL_SCHED_STD_H
 #define _KERNEL_SCHED_STD_H
 
 #include <linux/sched.h>
+#include <linux/types.h>
+
+#define STD_HIST_LEN	64
+#define STD_NN_HID	16
 
 #ifdef CONFIG_SMART_TASK_DISTRIBUTOR
 /*
- * Master switch: 1 enables steering (default), 0 disables
- * steering (near-zero cost). Clamped 0-1 via sysctl minmax and
- * std_running= boot param (plain 0 or 1 only).
+ * Master switch: 1 steers wakeups by default, 0 retains class choices
+ * at near-zero cost. Values clamp 0-1 through sysctl minmax and the
+ * std_running= boot parameter accepting plain 0 or 1 alone.
  */
 extern int std_running;
+/*
+ * Compact predictor identity (constant, read-only) beside its decision
+ * threshold (tunable through sysctl and the std_nn_thresh= boot
+ * parameter). The s32 predictor verdict weighs against this mark;
+ * raising the mark steadies placement against migration.
+ */
+extern const int std_nn_version;
+extern int std_nn_thresh;
 int std_select_cpu(struct task_struct *p, int cpu);
+int std_nn_predict(const u8 hist[STD_HIST_LEN]);
+void std_tick_hist(struct task_struct *p, int cpu);
+void std_init_hist(struct task_struct *p);
 #else
 static inline int std_select_cpu(struct task_struct *p, int cpu)
 {

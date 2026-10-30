@@ -12,7 +12,9 @@
 # No-sudo block (paste one line at a time):
 #   uname -r
 #   sysctl kernel.std_running
+#   sysctl kernel.std_nn_thresh
 #   cat /proc/sys/kernel/std_running
+#   cat /proc/sys/kernel/std_nn_thresh
 #   cat /proc/sys/kernel/std_stats
 #   taskset -c 0 sleep 0
 #   taskset -p $$ (bash; in fish use `taskset -p $fish_pid`)
@@ -24,7 +26,7 @@
 #   sudo -n grep -F -- "/STD kernel" /boot/limine.conf | grep -F -- "(7.3.0-std)" (same line via pipe; legacy `:STD 7.3.0-std` also accepted with token-boundary; BLS never satisfies)
 #   sudo -n modinfo -k 7.3.0-std -F filename nvidia
 #   sudo -n find -- /lib/modules/7.3.0-std -name 'nvidia.ko*'
-#   sudo -n dmesg | grep -E -- 'std_running|std_stats|register_sysctl_sz|procname null|(^|[^A-Za-z0-9_])STD([^A-Za-z0-9_]|$)'
+#   sudo -n dmesg | grep -E -- 'std_running|std_stats|std_nn_thresh|std_nn_version|register_sysctl_sz|procname null|(^|[^A-Za-z0-9_])STD([^A-Za-z0-9_]|$)'
 #
 # Automated bundle (same checks, still read-only):
 #   bash /home/galpt/Desktop/github/workspace-for-sdt/scripts/verify-std.sh
@@ -41,20 +43,21 @@
 #     (boot override `std_running=0/1`); missing key means non-STD.
 #   cat std_running: expected `0` or `1`; same cases as sysctl.
 #   cat std_stats: expected dynamic-width bordered vertical 2-column
-#     metric|value table (infinity-sched-like) with `fastpath` /
-#     `steered` / `fallback` rows in order (scaled SI-1000),
+#     metric|value table with `fastpath` / `steered` / `fallback` /
+#     `nn_keep` / `nn_migrate` / `split_core` / `nn_version` rows in
+#     order (scaled SI-1000, nn_version is const 1),
 #     `+...+` top/middle/bottom borders plus `|` header/value rows (checked:
 #     exact `| metric | value |` header in order, every `|`
-#     row exactly 2 columns (3 pipes), 3 metric rows in order, no
+#     row exactly 2 columns (3 pipes), 7 metric rows in order, no
 #     deficit/quantum/tin/sparse/bulk/decaying/host_load/
 #     enforced/denied/starve_bypass/Cake (word-boundary), >=3 `+` borders,
-#     >=4 `|` rows, >=7 lines; `0444`
+#     >=8 `|` rows, >=11 lines; `0444`
 #     read-only via stat, never chmod; write probe omitted to stay read-only,
 #     `-EROFS` on write is source-documented from proc_std_stats, not
 #     live-probed); anomalous is missing file, empty output, a table
 #     without `+---+` borders and the strict 2 columns, or any CAKE-style
 #     10-column table (extra columns / forbidden tokens fail closed).
-#   dmesg negative: expected empty for `grep -E -- 'std_running|std_stats|register_sysctl_sz|procname null|(^|[^A-Za-z0-9_])STD([^A-Za-z0-9_]|$)'`
+#   dmesg negative: expected empty for `grep -E -- 'std_running|std_stats|std_nn_thresh|std_nn_version|register_sysctl_sz|procname null|(^|[^A-Za-z0-9_])STD([^A-Za-z0-9_]|$)'`
 #     (STD emits no printk; do NOT use `grep -i std` alone: `zstd`,
 #     `systemd`, `BTRFS` are false positives; portable `(^|[^A-Za-z0-9_])STD`
 #     boundary is used because `\b` is GNU-only; `register_sysctl_sz` /
@@ -65,7 +68,8 @@
 #     the `sudo -n` variant instead of changing permissions.
 #   taskset smoke: expected exit `0` for `taskset -c 0 sleep 0` plus a
 #     printed affinity mask for `taskset -p $$` (1-2 CPU systems pass
-#     through unchanged; steering denies only with in-group allowed);
+#     through unchanged; affinity is honored with fallback to the
+#     class-selected CPU, no isolation requirement);
 #     anomalous is a non-zero exit or affinity error.
 #   stat initrd: expected size `>=50M` (`52428800` bytes; stock is hundreds
 #     of MB); anomalous is missing image, `0` bytes, or `<50M` (degraded,
@@ -80,6 +84,10 @@
 #     in `limine.conf` (4 candidates under BOOT_DIR); anomalous is either
 #     token missing, no `limine.conf` found, or BLS-only (a BLS entry
 #     never satisfies Limine). Do NOT reboot without a Limine STD+ver entry.
+#   isolation trio (isolcpus/nohz_full/rcu_nocbs): optional only.
+#     STD has no isolation requirement; trio tokens in the Limine cmdline
+#     or /proc/cmdline are informational and never fail verification.
+#     Absence is healthy; presence is tolerated (no normalization).
 #   modinfo nvidia: expected an `nvidia.ko` path for `-k <ver>` (`find`
 #     fallback when `modinfo` misses); anomalous is no path from either
 #     (DKMS not rebuilt for `<ver>`).
@@ -355,6 +363,45 @@ else
 	note_fail "cannot read /proc/sys/kernel/std_running (non-STD kernel?): ${running_val}"
 fi
 
+# 3b. sysctl + cat std_nn_thresh (no sudo; tunable s32 threshold).
+echo "--- sysctl std_nn_thresh ---"
+if thresh_out="$(sysctl kernel.std_nn_thresh 2>&1)"; then
+	echo "  ${thresh_out}"
+	if printf '%s' "${thresh_out}" | grep -Eq '^kernel\.std_nn_thresh *= *-?[0-9]+$'; then
+		echo "  OK: predictor threshold readable (tunable s32)."
+	else
+		note_fail "unexpected std_nn_thresh output: ${thresh_out}"
+	fi
+else
+	note_fail "sysctl kernel.std_nn_thresh failed (non-STD kernel?): ${thresh_out}"
+fi
+if thresh_val="$(cat /proc/sys/kernel/std_nn_thresh 2>&1)"; then
+	echo "  /proc/sys/kernel/std_nn_thresh: ${thresh_val}"
+	if printf '%s' "${thresh_val}" | grep -Eq '^-?[0-9]+$'; then
+		echo "  OK: threshold value ${thresh_val}."
+	else
+		note_fail "unexpected std_nn_thresh value: ${thresh_val}"
+	fi
+else
+	note_fail "cannot read /proc/sys/kernel/std_nn_thresh (non-STD kernel?): ${thresh_val}"
+fi
+
+# 3c. isolation trio optional (informational only, never fails).
+echo "--- isolation trio (optional) ---"
+echo "  Note: STD has no isolation requirement; trio presence is optional."
+if [ -f "/proc/cmdline" ]; then
+	trio_line="$(cat /proc/cmdline 2>/dev/null || true)"
+	echo "  /proc/cmdline: ${trio_line}" | head -c 300
+	echo ""
+	if printf '%s' "${trio_line}" | grep -Eq -- 'isolcpus=|nohz_full=|rcu_nocbs='; then
+		echo "  INFO: trio tokens present (tolerated, no normalization)."
+	else
+		echo "  OK: no trio tokens (healthy, isolation-free)."
+	fi
+else
+	echo "  SKIP: /proc/cmdline unreadable."
+fi
+
 # 4. cat std_stats bordered table (no sudo; read-only 0444 mode checked via stat, no chmod).
 # Write probe intentionally omitted to stay read-only: -EROFS on write is
 # source-documented (proc_std_stats returns -EROFS when dir != 0), not live-probed.
@@ -375,17 +422,25 @@ if stats_out="$(cat /proc/sys/kernel/std_stats 2>&1)"; then
 	bad_width="$(printf '%s\n' "${stats_out}" | grep -F -- '|' | awk -F'|' '{print NF-1}' | grep -Ev -- '^3$' || true)"
 	# CAKE extras must be absent (portable word-boundary; \b is GNU-only).
 	forbidden_hits="$(printf '%s' "${stats_out}" | grep -E -- '(^|[^A-Za-z0-9_])(sparse|bulk|decaying|host_load|enforced|denied|starve_bypass|deficit|quantum|tin|Cake)([^A-Za-z0-9_]|$)' || true)"
-	# Three metric rows must exist in fastpath/steered/fallback order.
+	# Seven metric rows must exist in fastpath/steered/fallback/nn_keep/nn_migrate/split_core/nn_version order.
 	fastpath_num="$(printf '%s\n' "${stats_out}" | grep -n -F -- '|' | grep -E -- '(^|[^A-Za-z0-9_])fastpath([^A-Za-z0-9_]|$)' | head -n 1 | cut -d: -f1 || true)"
 	steered_num="$(printf '%s\n' "${stats_out}" | grep -n -F -- '|' | grep -E -- '(^|[^A-Za-z0-9_])steered([^A-Za-z0-9_]|$)' | head -n 1 | cut -d: -f1 || true)"
 	fallback_num="$(printf '%s\n' "${stats_out}" | grep -n -F -- '|' | grep -E -- '(^|[^A-Za-z0-9_])fallback([^A-Za-z0-9_]|$)' | head -n 1 | cut -d: -f1 || true)"
+	nn_keep_num="$(printf '%s\n' "${stats_out}" | grep -n -F -- '|' | grep -E -- '(^|[^A-Za-z0-9_])nn_keep([^A-Za-z0-9_]|$)' | head -n 1 | cut -d: -f1 || true)"
+	nn_migrate_num="$(printf '%s\n' "${stats_out}" | grep -n -F -- '|' | grep -E -- '(^|[^A-Za-z0-9_])nn_migrate([^A-Za-z0-9_]|$)' | head -n 1 | cut -d: -f1 || true)"
+	split_core_num="$(printf '%s\n' "${stats_out}" | grep -n -F -- '|' | grep -E -- '(^|[^A-Za-z0-9_])split_core([^A-Za-z0-9_]|$)' | head -n 1 | cut -d: -f1 || true)"
+	nn_version_num="$(printf '%s\n' "${stats_out}" | grep -n -F -- '|' | grep -E -- '(^|[^A-Za-z0-9_])nn_version([^A-Za-z0-9_]|$)' | head -n 1 | cut -d: -f1 || true)"
 	case "${fastpath_num}" in ''|*[!0-9]*) fastpath_num=0 ;; esac
 	case "${steered_num}" in ''|*[!0-9]*) steered_num=0 ;; esac
 	case "${fallback_num}" in ''|*[!0-9]*) fallback_num=0 ;; esac
-	if printf '%s\n' "${header_line}" | grep -Eq -- '^\|[[:space:]]*metric[[:space:]]*\|[[:space:]]*value[[:space:]]*\|[[:space:]]*$' && [ "${header_pipes}" -eq 3 ] && [ -z "${bad_width}" ] && [ -z "${forbidden_hits}" ] && [ "${border_count}" -ge 3 ] && [ "${pipe_count}" -ge 4 ] && [ "${line_count}" -ge 7 ] && [ "${fastpath_num}" -gt 0 ] && [ "${steered_num}" -gt "${fastpath_num}" ] && [ "${fallback_num}" -gt "${steered_num}" ]; then
-		echo "  OK: vertical table with fastpath / steered / fallback rows in order (${border_count} borders, ${pipe_count} piped rows, ${line_count} lines)."
+	case "${nn_keep_num}" in ''|*[!0-9]*) nn_keep_num=0 ;; esac
+	case "${nn_migrate_num}" in ''|*[!0-9]*) nn_migrate_num=0 ;; esac
+	case "${split_core_num}" in ''|*[!0-9]*) split_core_num=0 ;; esac
+	case "${nn_version_num}" in ''|*[!0-9]*) nn_version_num=0 ;; esac
+	if printf '%s\n' "${header_line}" | grep -Eq -- '^\|[[:space:]]*metric[[:space:]]*\|[[:space:]]*value[[:space:]]*\|[[:space:]]*$' && [ "${header_pipes}" -eq 3 ] && [ -z "${bad_width}" ] && [ -z "${forbidden_hits}" ] && [ "${border_count}" -ge 3 ] && [ "${pipe_count}" -ge 8 ] && [ "${line_count}" -ge 11 ] && [ "${fastpath_num}" -gt 0 ] && [ "${steered_num}" -gt "${fastpath_num}" ] && [ "${fallback_num}" -gt "${steered_num}" ] && [ "${nn_keep_num}" -gt "${fallback_num}" ] && [ "${nn_migrate_num}" -gt "${nn_keep_num}" ] && [ "${split_core_num}" -gt "${nn_migrate_num}" ] && [ "${nn_version_num}" -gt "${split_core_num}" ]; then
+		echo "  OK: vertical table with fastpath / steered / fallback / nn_keep / nn_migrate / split_core / nn_version rows in order (${border_count} borders, ${pipe_count} piped rows, ${line_count} lines)."
 	else
-		note_fail "std_stats lacks strict vertical 2-column table in order (need exact '| metric | value |' header, every '|' row exactly 2 cols, fastpath/steered/fallback rows in order, no deficit/quantum/tin/sparse/bulk/decaying/host_load/enforced/denied/starve_bypass/Cake, >=3 '+' borders, >=4 '|' rows, >=7 lines; got borders=${border_count} pipes=${pipe_count} lines=${line_count})."
+		note_fail "std_stats lacks strict vertical 2-column table in order (need exact '| metric | value |' header, every '|' row exactly 2 cols, fastpath/steered/fallback/nn_keep/nn_migrate/split_core/nn_version rows in order, no deficit/quantum/tin/sparse/bulk/decaying/host_load/enforced/denied/starve_bypass/Cake, >=3 '+' borders, >=8 '|' rows, >=11 lines; got borders=${border_count} pipes=${pipe_count} lines=${line_count})."
 	fi
 	# Read-only mode check (stat only, never chmod): expect 0444 (`stat -c %a` reports 444).
 	# Direct stat first, sudo -n fallback for hardened /proc mounts; unknown is
@@ -412,7 +467,7 @@ fi
 # register_sysctl_sz/procname null catch sysctl-table registration failures.
 echo "--- dmesg negative ---"
 echo "  Note: never use 'grep -i std' alone (zstd/systemd/BTRFS false positives)."
-STD_DMESG_PAT='std_running|std_stats|register_sysctl_sz|procname null|(^|[^A-Za-z0-9_])STD([^A-Za-z0-9_]|$)'
+STD_DMESG_PAT='std_running|std_stats|std_nn_thresh|std_nn_version|register_sysctl_sz|procname null|(^|[^A-Za-z0-9_])STD([^A-Za-z0-9_]|$)'
 if [ "${HAVE_SUDO}" -eq 1 ] && sudo -n dmesg >/dev/null 2>&1; then
 	std_hits="$(sudo -n dmesg 2>/dev/null | grep -E -- "${STD_DMESG_PAT}" || true)"
 	if [ -z "${std_hits}" ]; then

@@ -1,0 +1,77 @@
+From 08ac8d7144ab39f6e6de32003fe703edcb17c894 Mon Sep 17 00:00:00 2001
+From: Galih Tama <galpt@v.recipes>
+Date: Fri, 30 Oct 2026 13:15:32 +0700
+Subject: [PATCH 5/5] STD: add scheduler trace documentation
+
+Add Documentation/scheduler/sched-std.rst covering the compact
+predictor, its counters and tracing with existing scheduler
+tracepoints (sched_migrate_task, sched_wakeup, sched_switch) plus
+std_stats. Steering stays silent on wakeup; observe placement with
+ftrace, trace-cmd, perf and the vertical metric|value table.
+
+Signed-off-by: Galih Tama <galpt@v.recipes>
+---
+ Documentation/scheduler/sched-std.rst | 51 +++++++++++++++++++++++++++
+ 1 file changed, 51 insertions(+)
+ create mode 100644 Documentation/scheduler/sched-std.rst
+
+diff --git a/Documentation/scheduler/sched-std.rst b/Documentation/scheduler/sched-std.rst
+new file mode 100644
+index 000000000..04d72257a
+--- /dev/null
++++ b/Documentation/scheduler/sched-std.rst
+@@ -0,0 +1,51 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++=====================
++Smart Task Distributor
++=====================
++
++STD refines wakeup placement toward idle capacity within existing
++classes. Fair tasks consult a tiny fixed-point predictor; real-time
++tasks accept only idle destinations; deadline tasks respect a laxity
++veto before consulting the predictor; idle tasks remain in place.
++Candidates derive from the allowed mask, preferring a fully idle
++core, then any idle CPU, then a spread fallback.
++
++Predictor
++=========
++
++The predictor maps 64 history entries (recent wake CPUs as u8 values
++beside a u8 cursor per task, reset at fork) through 16 hidden s32
++units with ReLU into one s32 verdict weighed against
++``std_nn_thresh``. Deterministic s8 coefficients hold zero mean with
++s32 accumulation built from integer addition and multiplication in
++preallocated non-sleeping wakeup context. ``std_nn_version`` reads
++const 1; ``std_nn_thresh`` starts at 0, adjustable through sysfs and
++the ``std_nn_thresh=`` boot parameter.
++
++Counters
++========
++
++Per-CPU ``fastpath``, ``steered``, ``fallback``, ``nn_keep``,
++``nn_migrate`` and ``split_core`` plus const ``nn_version`` are exposed
++via the read-only ``kernel.std_stats`` vertical 2-column metric|value
++table with SI-1000 scaling. ``kernel.std_running`` (0/1) and
++``kernel.std_nn_thresh`` (s32) are read-write.
++
++Tracing
++=======
++
++Steering stays silent on wakeup. Observe placement through existing
++scheduler tracepoints alongside the STD table::
++
++  cat /proc/sys/kernel/std_stats
++  sysctl kernel.std_running kernel.std_nn_thresh
++  trace-cmd record -e sched_migrate_task -e sched_wakeup -e sched_switch
++  trace-cmd report | head
++  perf stat -e sched:sched_migrate_task taskset -c 0 sleep 0
++
++A ``std_stats`` row set of fastpath/steered/fallback/nn_keep/nn_migrate/
++split_core/nn_version in order with ``| metric | value |`` header and
++``+---+`` borders indicates a healthy STD boot. Cross-check
++``nn_keep``/``nn_migrate`` against ``fastpath``/``steered`` to see
++predictor influence, and ``split_core`` to see whole-core misses.
+-- 
+2.56.0
+
