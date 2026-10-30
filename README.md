@@ -12,11 +12,13 @@ STD is a place to try those ideas without shaking the stable ones. Some ideas ar
 
 ## How does it work?
 
-When a task wakes up, it becomes ready to run and the kernel must pick a CPU for it. STD looks at that pick and may move it toward idle capacity. A tiny model with fixed weights reads the last 64 wakeup CPUs for the task and votes to stay put or to move. It only guesses patterns. It learns nothing at runtime.
+When a task wakes up, it becomes ready to run and the kernel must pick a CPU for it. STD looks at that pick and may move it toward idle capacity. A tiny model with fixed weights reads the last 64 wakeup CPUs for the task and votes to stay put or to move. It only scores history, with no runtime learning.
 
-Right now STD carries a small predictor that votes to stay or to move. It looks at the last 64 CPUs a task woke up on and feeds them through 16 ReLU units built from s8 weights and s32 sums to reach one verdict. Each class then uses that vote in its own way. Deadline tasks stay when laxity drops below 2 ms, where laxity means time left minus work left. Real-time tasks move only to an idle CPU. Fair tasks move when the vote says move and a free allowed CPU exists. Idle tasks never move. The vote sees only past placements, so it stays cheap compared with older averaging tricks.
+Right now STD carries a small predictor that votes to stay or to move. It looks at the last 64 CPUs a task woke up on and feeds them through 16 ReLU units built from s8 weights and s32 sums to reach one conclusion. It was chosen over other averaging tricks such as EMA or EWMA because those smooths fold history into one fading mean while ReLU can spot nonlinear patterns across recent placements and it is still cheap enough.
 
-Allowed CPUs always win. STD picks only from the CPUs the task may run on and otherwise keeps the first choice. A threshold knob tunes eagerness, and higher values move less often. Deadline tasks with little laxity left stay put. Real-time tasks move only when the destination is idle. Fair tasks follow the vote. Idle tasks never move. A few cases pass through untouched. Systems with fewer than three online CPUs stay on the old path, and so do stop tasks and tasks pinned to one CPU. The same holds for tasks with migration turned off and for core-scheduled or extensible SCX tasks. Setting the std_running switch to 0 also leaves every choice alone at near-zero cost. The rest are tried first on a fully idle core, then on any idle CPU, and then by spread fallback. Each result is counted in a small vertical table of metrics and values.
+Each class then uses that vote in its own way. Deadline tasks stay when laxity drops below 2 ms, where laxity means time left minus work left. Real-time tasks move only to an idle CPU. Fair tasks move when the vote says move and a free allowed CPU exists. Idle tasks never move. The vote sees only past placements, so it stays cheap compared with older averaging tricks.
+
+Systems with fewer than three online CPUs stay on the old path, and so do stop tasks and tasks pinned to one CPU. The same holds for tasks with migration turned off and for core-scheduled or extensible SCX tasks. Setting the std_running switch to 0 also leaves every choice alone at near-zero cost. The rest are tried first on a fully idle core, then on any idle CPU, and then by spread fallback. Each result is counted in a small vertical table of metrics and values.
 
 ```mermaid
 flowchart TD
@@ -24,13 +26,15 @@ flowchart TD
     B -->|0| Z["keep class CPU"]
     B -->|1| C{"small? stop? pinned? migrating? core? EXT?"}
     C -->|passthrough| Z
-    C -->|steerable| D{"DL? RT? Idle? Fair?"}
+    C -->|steerable| V["vote: 64 hist through 16 ReLU to s32 out"]
+    V --> T{"out > std_nn_thresh?"}
+    T -->|keep| Z
+    T -->|migrate| D{"DL? RT? Idle? Fair?"}
     D -->|DL laxity veto| Z["keep (fallback)"]
     D -->|RT non-idle dest| Z["keep (fallback)"]
-    D -->|Idle| Z["never migrates (fastpath)"]
-    D -->|Fair or RT idle or DL pass plus migrate vote| G["whole idle core first, then any idle, then spread"]
-    G --> H["vertical table with fastpath, steered, fallback, nn_keep, nn_migrate, split_core and nn_version"]
-    H --> Z
+    D -->|Idle| Z["never migrates (fastpath, no vote)"]
+    D -->|Fair or RT idle or DL pass| G["whole idle core first, then any idle, then spread"]
+    G --> H["vertical table with fastpath, steered, fallback, nn_keep, nn_migrate, split_core and nn_version"] --> Z
 ```
 
 ## Project Structure
@@ -71,6 +75,11 @@ scripts/install.sh --yes --install-deps linux-fresh-7.3
 scripts/install.sh --yes --reinstall-nvidia linux-fresh-7.3
 scripts/install.sh --yes --write-modprobe linux-fresh-7.3
 scripts/install.sh --yes --write-bls linux-fresh-7.3
+
+# cleanup after installed
+scripts/cleanup.sh --dry-run linux-fresh-7.3
+scripts/cleanup.sh --status linux-fresh-7.3
+scripts/cleanup.sh --yes linux-fresh-7.3
 
 # revert / prune
 scripts/uninstall.sh --dry-run linux-fresh-7.3
@@ -129,8 +138,8 @@ You can also use `cat /proc/sys/kernel/std_stats` to check whether STD works as 
 |---|---|---|---|---|
 | `std_running` | `/proc/sys/kernel/std_running` | `0` or `1` | `1` | Master switch. `1` steering (default), `0` off (near-zero cost). |
 | `std_nn_thresh` | `/proc/sys/kernel/std_nn_thresh` | `s32` | `0` | Predictor threshold. Larger values make migration rarer. |
-| `std_stats` | `/proc/sys/kernel/std_stats` | n/a | n/a | Vertical 2-column metric/value table of per-CPU sums (`fastpath`, `steered`, `fallback`, `nn_keep`, `nn_migrate`, `split_core`, `nn_version` const); measured widths, `memory_read_from_buffer`. |
-| `std_nn_version` | `src/std.h` const + stats row | n/a | `1` | Predictor identity; bumped when weights or semantics change. |
+| `std_stats` | `/proc/sys/kernel/std_stats` | n/a | n/a | Vertical 2-column metric/value table of per-CPU sums (`fastpath`, `steered`, `fallback`, `nn_keep`, `nn_migrate`, `split_core`, `nn_version` const). Widths are measured. Reads use `memory_read_from_buffer`. |
+| `std_nn_version` | `src/std.h` const + stats row | n/a | `1` | Predictor identity. It is bumped when weights or semantics change. |
 
 > [!TIP]
 > This is optional. After booting the STD entry, confirm steering with `cat`, `taskset`, and `sysctl` above (restore to `1` afterwards) without altering boot configuration.
