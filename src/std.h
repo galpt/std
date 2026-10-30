@@ -2,16 +2,18 @@
 /*
  * Smart Task Distributor (STD) routing shim.
  *
- * Steers wakeup placement above the deadline class with no new
+ * Fair/Idle-only shim above the deadline class with no new
  * scheduling class. Fair and idle tasks prefer housekeeping CPUs
- * while deadline and real-time tasks prefer non-housekeeping CPUs
- * with SMT-aware idle selection. Cross-group picks are denied
- * only when an in-group allowed CPU exists, otherwise the original
- * CPU is kept. Affinity is honored with fallback to the
- * class-selected CPU. Extensible tasks defer to SCX; core check is
- * rq-wide and may over-skip. Small systems with fewer than three
- * online CPUs stay off. Without HK_TYPE_DOMAIN isolation all CPUs
- * are housekeeping and the class CPU is kept.
+ * with SMT-aware idle selection; deadline and real-time tasks pass
+ * through to the class-selected (SIS) CPU with no counters.
+ * Deny cross-group only when an in-group allowed CPU
+ * exists, otherwise the original CPU is kept. Affinity is honored
+ * with fallback to the class-selected CPU. Extensible tasks defer
+ * to SCX; core check is rq-wide and may over-skip. Small systems
+ * with fewer than three online CPUs stay off. Without
+ * HK_TYPE_DOMAIN isolation all CPUs are housekeeping and the class
+ * CPU is kept. LLC tier removed (SIS-deference); stats are a
+ * vertical 2-column metric|value table.
  */
 #ifndef _KERNEL_SCHED_STD_H
 #define _KERNEL_SCHED_STD_H

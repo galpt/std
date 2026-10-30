@@ -1,35 +1,37 @@
-From b0a52b666c02bb3888406676cdb1ced4a0b9f02e Mon Sep 17 00:00:00 2001
+From b0a52b666c02bb3888406c1ced4a0b9f1ced Mon Sep 17 00:00:00 2001
 From: Galih Tama <galpt@v.recipes>
-Date: Thu, 29 Oct 2026 22:27:50 +0700
-Subject: [PATCH 4/4] STD: hook select_task_rq
+Date: Fri, 30 Oct 2026 11:30:00 +0700
+Subject: [PATCH 4/4] STD: hook select_task_rq Fair/Idle-only
 
-Hook select_task_rq via std_select_cpu. Keeps routing above deadline
-with no new class. Respects affinity and small-system guard; pinned,
-migrating, core (rq-wide, may over-skip) and EXT pass through, stop
-never intercepted. Steers with SMT-aware idle selection denying
-cross-group only when in-group allowed exists. Placement
-stays at wakeup time; the pick path is untouched so the disabled cost
-is near-zero.
+Hook select_task_rq via std_select_cpu. Keeps Fair/Idle-only
+routing above deadline with no new class. Respects affinity and
+small-system guard; pinned, migrating, core (rq-wide, may
+over-skip) and EXT pass through, stop never intercepted, DL/RT
+pass through (SIS, no counters, LLC tier removed). Steers Fair/Idle
+with SMT-aware idle selection denying cross-group only when
+in-group allowed exists. Placement stays at wakeup time; the pick
+path is untouched so the disabled cost is near-zero.
 
 Signed-off-by: Galih Tama <galpt@v.recipes>
 ---
- kernel/sched/core.c | 8 ++++++++
- 1 file changed, 8 insertions(+)
+ kernel/sched/core.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
 
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 1754d9f95..5e3a7ac66 100644
+index 1754d9f95..e5dba0588 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
-@@ -3634,6 +3634,14 @@ int select_task_rq(struct task_struct *p, int cpu, int *wake_flags)
+@@ -3634,6 +3634,15 @@ int select_task_rq(struct task_struct *p, int cpu, int *wake_flags)
  
  	if (p->nr_cpus_allowed > 1 && !is_migration_disabled(p)) {
  		cpu = p->sched_class->select_task_rq(p, cpu, *wake_flags);
 +		/*
-+		 * STD routing shim above deadline: SMT-aware idle
-+		 * selection for the preferred group, denying cross-group
-+		 * only when in-group allowed exists; honoring affinity; stop
-+		 * never intercepted, pinned/migrating/core(rq-wide, may
-+		 * over-skip)/EXT pass through. Wakeup only; pick untouched.
++		 * STD Fair/Idle-only routing shim above deadline: SMT-aware
++		 * idle selection for housekeeping, denying cross-group only
++		 * when in-group allowed exists; honoring affinity; stop never
++		 * intercepted, pinned/migrating/core(rq-wide, may
++		 * over-skip)/EXT pass through; DL/RT pass through (SIS, no
++		 * counters); LLC tier removed. Wakeup only; pick untouched.
 +		 */
 +		cpu = std_select_cpu(p, cpu);
  		*wake_flags |= WF_RQ_SELECTED;

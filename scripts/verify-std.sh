@@ -40,17 +40,19 @@
 #     steering (default), `0` is off
 #     (boot override `std_running=0/1`); missing key means non-STD.
 #   cat std_running: expected `0` or `1`; same cases as sysctl.
-#   cat std_stats: expected dynamic-width bordered approximate table with
-#     `fastpath` / `steered` / `fallback` in order (scaled SI-1000),
+#   cat std_stats: expected dynamic-width bordered vertical 2-column
+#     metric|value table (infinity-sched-like) with `fastpath` /
+#     `steered` / `fallback` rows in order (scaled SI-1000),
 #     `+...+` top/middle/bottom borders plus `|` header/value rows (checked:
-#     exact `| fastpath | steered | fallback |` header in order, every `|`
-#     row exactly 3 columns (4 pipes), no sparse/bulk/decaying/host_load/
-#     enforced/denied/starve_bypass (word-boundary), >=3 `+` borders,
-#     >=2 `|` rows, >=5 lines; `0444`
+#     exact `| metric | value |` header in order, every `|`
+#     row exactly 2 columns (3 pipes), 3 metric rows in order, no
+#     deficit/quantum/tin/sparse/bulk/decaying/host_load/
+#     enforced/denied/starve_bypass/Cake (word-boundary), >=3 `+` borders,
+#     >=4 `|` rows, >=7 lines; `0444`
 #     read-only via stat, never chmod; write probe omitted to stay read-only,
 #     `-EROFS` on write is source-documented from proc_std_stats, not
 #     live-probed); anomalous is missing file, empty output, a table
-#     without `+---+` borders and the strict 3 columns, or any CAKE-style
+#     without `+---+` borders and the strict 2 columns, or any CAKE-style
 #     10-column table (extra columns / forbidden tokens fail closed).
 #   dmesg negative: expected empty for `grep -E -- 'std_running|std_stats|register_sysctl_sz|procname null|(^|[^A-Za-z0-9_])STD([^A-Za-z0-9_]|$)'`
 #     (STD emits no printk; do NOT use `grep -i std` alone: `zstd`,
@@ -365,18 +367,25 @@ if stats_out="$(cat /proc/sys/kernel/std_stats 2>&1)"; then
 	case "${border_count}" in ''|*[!0-9]*) border_count=0 ;; esac
 	case "${pipe_count}" in ''|*[!0-9]*) pipe_count=0 ;; esac
 	case "${line_count}" in ''|*[!0-9]*) line_count=0 ;; esac
-	header_line="$(printf '%s\n' "${stats_out}" | grep -F -- '|' | grep -E -- 'fastpath.*steered.*fallback' | head -n 1 || true)"
+	header_line="$(printf '%s\n' "${stats_out}" | grep -F -- '|' | grep -E -- 'metric.*value' | head -n 1 || true)"
 	header_pipes="$(printf '%s' "${header_line}" | tr -cd '|' | wc -c | tr -d ' ' || true)"
 	case "${header_pipes}" in ''|*[!0-9]*) header_pipes=0 ;; esac
-	# Strict 3-column gate: every '|' row must delimit exactly 3 columns
-	# (4 pipes); any wider CAKE-style row fails. Non-empty means bad width.
-	bad_width="$(printf '%s\n' "${stats_out}" | grep -F -- '|' | awk -F'|' '{print NF-1}' | grep -Ev -- '^4$' || true)"
+	# Strict vertical 2-column gate: every '|' row must delimit exactly 2 columns
+	# (3 pipes); any wider CAKE-style row fails. Non-empty means bad width.
+	bad_width="$(printf '%s\n' "${stats_out}" | grep -F -- '|' | awk -F'|' '{print NF-1}' | grep -Ev -- '^3$' || true)"
 	# CAKE extras must be absent (portable word-boundary; \b is GNU-only).
-	forbidden_hits="$(printf '%s' "${stats_out}" | grep -E -- '(^|[^A-Za-z0-9_])(sparse|bulk|decaying|host_load|enforced|denied|starve_bypass)([^A-Za-z0-9_]|$)' || true)"
-	if printf '%s\n' "${header_line}" | grep -Eq -- '^\|[[:space:]]*fastpath[[:space:]]*\|[[:space:]]*steered[[:space:]]*\|[[:space:]]*fallback[[:space:]]*\|[[:space:]]*$' && [ "${header_pipes}" -eq 4 ] && [ -z "${bad_width}" ] && [ -z "${forbidden_hits}" ] && [ "${border_count}" -ge 3 ] && [ "${pipe_count}" -ge 2 ] && [ "${line_count}" -ge 5 ]; then
-		echo "  OK: bordered table with fastpath / steered / fallback in order (${border_count} borders, ${pipe_count} piped rows, ${line_count} lines)."
+	forbidden_hits="$(printf '%s' "${stats_out}" | grep -E -- '(^|[^A-Za-z0-9_])(sparse|bulk|decaying|host_load|enforced|denied|starve_bypass|deficit|quantum|tin|Cake)([^A-Za-z0-9_]|$)' || true)"
+	# Three metric rows must exist in fastpath/steered/fallback order.
+	fastpath_num="$(printf '%s\n' "${stats_out}" | grep -n -F -- '|' | grep -E -- '(^|[^A-Za-z0-9_])fastpath([^A-Za-z0-9_]|$)' | head -n 1 | cut -d: -f1 || true)"
+	steered_num="$(printf '%s\n' "${stats_out}" | grep -n -F -- '|' | grep -E -- '(^|[^A-Za-z0-9_])steered([^A-Za-z0-9_]|$)' | head -n 1 | cut -d: -f1 || true)"
+	fallback_num="$(printf '%s\n' "${stats_out}" | grep -n -F -- '|' | grep -E -- '(^|[^A-Za-z0-9_])fallback([^A-Za-z0-9_]|$)' | head -n 1 | cut -d: -f1 || true)"
+	case "${fastpath_num}" in ''|*[!0-9]*) fastpath_num=0 ;; esac
+	case "${steered_num}" in ''|*[!0-9]*) steered_num=0 ;; esac
+	case "${fallback_num}" in ''|*[!0-9]*) fallback_num=0 ;; esac
+	if printf '%s\n' "${header_line}" | grep -Eq -- '^\|[[:space:]]*metric[[:space:]]*\|[[:space:]]*value[[:space:]]*\|[[:space:]]*$' && [ "${header_pipes}" -eq 3 ] && [ -z "${bad_width}" ] && [ -z "${forbidden_hits}" ] && [ "${border_count}" -ge 3 ] && [ "${pipe_count}" -ge 4 ] && [ "${line_count}" -ge 7 ] && [ "${fastpath_num}" -gt 0 ] && [ "${steered_num}" -gt "${fastpath_num}" ] && [ "${fallback_num}" -gt "${steered_num}" ]; then
+		echo "  OK: vertical table with fastpath / steered / fallback rows in order (${border_count} borders, ${pipe_count} piped rows, ${line_count} lines)."
 	else
-		note_fail "std_stats lacks strict bordered 3-column table in order (need exact '| fastpath | steered | fallback |' header, every '|' row exactly 3 cols, no sparse/bulk/decaying/host_load/enforced/denied/starve_bypass, >=3 '+' borders, >=2 '|' rows, >=5 lines; got borders=${border_count} pipes=${pipe_count} lines=${line_count})."
+		note_fail "std_stats lacks strict vertical 2-column table in order (need exact '| metric | value |' header, every '|' row exactly 2 cols, fastpath/steered/fallback rows in order, no deficit/quantum/tin/sparse/bulk/decaying/host_load/enforced/denied/starve_bypass/Cake, >=3 '+' borders, >=4 '|' rows, >=7 lines; got borders=${border_count} pipes=${pipe_count} lines=${line_count})."
 	fi
 	# Read-only mode check (stat only, never chmod): expect 0444 (`stat -c %a` reports 444).
 	# Direct stat first, sudo -n fallback for hardened /proc mounts; unknown is

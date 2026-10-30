@@ -2,9 +2,9 @@
 
 ## Overview
 
-STD aims to provide better desktop interactivity by SMT-aware steering of DL and RT tasks away from Fair and idle tasks; extensible (EXT) tasks defer to SCX and are not steered.
+STD aims to provide better desktop interactivity by Fair/Idle-only SMT-aware steering toward housekeeping; deadline and real-time pass through (SIS-deference, no counters); extensible (EXT) tasks defer to SCX and are not steered.
 
-STD steers wakeups above deadline without a new scheduling class. Fair and idle tasks prefer housekeeping CPUs. Deadline and real-time tasks prefer non-housekeeping CPUs. Affinity uses `cpumask` intersection with fallback and SMT-aware selection. Stop tasks are never intercepted while pinned, migrate-disabled, core-scheduled (rq-wide, may over-skip) and EXT pass through.
+STD steers wakeups above deadline without a new scheduling class. Fair and idle tasks prefer housekeeping CPUs with SMT-aware selection (fully-idle core first, any idle, distribute fallback; no LLC probe). Deadline and real-time tasks pass through to the class-selected CPU. Affinity uses `cpumask` intersection with fallback. Stop tasks are never intercepted while pinned, migrate-disabled, core-scheduled (rq-wide, may over-skip) and EXT pass through.
 
 > [!NOTE]
 > STD disables itself on <3 online CPUs.
@@ -59,7 +59,7 @@ uname -r
 sysctl kernel.std_running
 # expect 1 (steering, default); 0 off
 cat /proc/sys/kernel/std_running /proc/sys/kernel/std_stats
-# expect 1 plus bordered 3-column table (fastpath / steered / fallback)
+# expect 1 plus vertical 2-column metric/value table (fastpath / steered / fallback rows)
 taskset -c 0 sleep 0
 taskset -p $$
 ```
@@ -71,7 +71,7 @@ Confirm with `patch --dry-run`, `git apply --check` and `checkpatch.pl --strict`
 | Tunable | Path | Range | Default | Description |
 |---|---|---|---|---|
 | `std_running` | `/proc/sys/kernel/std_running` | `0` or `1` | `1` | Master switch. `1` steering (default), `0` off (near-zero cost). |
-| `std_stats` | `/proc/sys/kernel/std_stats` | — | — | Bordered 3-column table of per-CPU sums (`fastpath`, `steered`, `fallback`); measured widths, `memory_read_from_buffer`. |
+| `std_stats` | `/proc/sys/kernel/std_stats` | — | — | Vertical 2-column metric/value table of per-CPU sums (`fastpath`, `steered`, `fallback` rows); measured widths, `memory_read_from_buffer`. |
 
 > [!TIP]
 > This is optional. After booting the STD entry, verify steering without changing boot config via `cat`, `taskset`, and `sysctl` above (restore to `1` afterwards).
@@ -82,16 +82,16 @@ Confirm with `patch --dry-run`, `git apply --check` and `checkpatch.pl --strict`
 flowchart TD
     A["select_task_rq wakeup"] --> B{"std_running?"}
     B -->|0| Z["keep class CPU"]
-    B -->|1| C{"isolation? small? stop? pinned? migrating? core(rq-wide)? EXT?"}
+    B -->|1| C{"isolation? small? stop? pinned? migrating? core&#40;rq-wide&#41;? EXT?"}
     %% guards in code order
     C -->|passthrough| Z
     C -->|steerable| D{"dl or rt?"}
-    D -->|yes| E["prefer non-housekeeping, SMT-aware, fallback"]
+    D -->|yes| E["passthrough (SIS, no counters)"]
     D -->|no| F{"idle or fair?"}
     F -->|yes| G["prefer housekeeping, SMT-aware, fallback"]
     F -->|no| Z
-    E --> H["3 counters: fastpath / steered / fallback"]
-    G --> H
+    E --> Z
+    G --> H["vertical metric/value: fastpath / steered / fallback"]
     H --> Z
 ```
 
@@ -101,10 +101,10 @@ flowchart TD
 |---|---|---|---|
 | New scheduling class | — | No (shim above deadline) | Yes (`sched_ext`) |
 | Fair/idle prefer housekeeping | No | Yes (SMT-aware, affinity-safe) | Policy-dependent |
-| Deadline/RT prefer non-housekeeping | No | Yes (SMT-aware, affinity-safe) | Policy-dependent |
+| Deadline/RT placement | No | Pass-through (SIS, no counters) | No (higher class preempts SCX) |
 | Small-system guard (<3 CPUs) | — | Pass-through | Varies |
 | Live toggle | — | `kernel.std_running` (`0`/`1`) + `std_running=` | Varies |
-| Read-only stats table | — | `kernel.std_stats` bordered 3-column, `-EROFS` on write | Varies |
+| Read-only stats table | — | `kernel.std_stats` vertical 2-column metric/value, `-EROFS` on write | Varies |
 | Fail-closed install | — | `sudo -n` only, `dry-run`/`status` no-mutate, `checkpatch --strict` | — |
 
 ## License
