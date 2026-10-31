@@ -6,7 +6,7 @@ STD aims to provide better desktop interactivity and multitasking performance.
 
 ## Why?
 
-We have similar projects like the [scx_flow](https://github.com/galpt/scx_flow_new) and [Infinity](https://github.com/galpt/infinity-scheduler) schedulers, but trying new ideas is hard once a project is considered somewhat stable.
+We have similar projects like the [scx_flow](https://github.com/sched-ext/scx/tree/main/scheds/experimental/scx_flow) and [Infinity](https://github.com/galpt/infinity-scheduler) schedulers, but trying new ideas is hard once a project is considered somewhat stable.
 
 STD is a place to try those ideas without shaking the stable ones. Some ideas arrive proven from Infinity and scx_flow. Others come from papers or are our own. Trying them here lets scx_flow and Infinity stay stable.
 
