@@ -12,11 +12,9 @@ STD is a place to try those ideas without shaking the stable ones. Some ideas ar
 
 ## How does it work?
 
-When a task wakes up, it becomes ready to run and the kernel must pick a CPU for it. STD looks at that pick and may move it toward idle capacity. A tiny model with fixed weights reads the last 64 wakeup CPUs for the task and votes to stay put or to move. It only scores history, with no runtime learning.
-
 Right now STD carries a small predictor that votes to stay or to move. It looks at the last 64 CPUs a task woke up on and feeds them through 16 ReLU units built from s8 weights and s32 sums to reach one conclusion. It was chosen over other averaging tricks such as EMA or EWMA because those smooths fold history into one fading mean while ReLU can spot nonlinear patterns across recent placements and it is still cheap enough.
 
-Each class then uses that vote in its own way. Deadline tasks stay when laxity drops below 2 ms, where laxity means time left minus work left. Real-time tasks move only to an idle CPU. Fair tasks move when the vote says move and a free allowed CPU exists. Idle tasks never move. The vote sees only past placements, so it stays cheap compared with older averaging tricks.
+Each class then uses that vote in its own way. Deadline tasks stay when laxity drops below 2 ms, where laxity means time left minus work left. Real-time tasks move only to an idle CPU. Fair tasks move when the vote says move and a free allowed CPU exists. Idle tasks never move. The vote sees only past placements.
 
 Systems with fewer than three online CPUs stay on the old path, and so do stop tasks and tasks pinned to one CPU. The same holds for tasks with migration turned off and for core-scheduled or extensible SCX tasks. Setting the std_running switch to 0 also leaves every choice alone at near-zero cost. The rest are tried first on a fully idle core, then on any idle CPU, and then by spread fallback. Each result is counted in a small vertical table of metrics and values.
 
