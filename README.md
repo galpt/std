@@ -74,10 +74,11 @@ scripts/install.sh --yes --reinstall-nvidia linux-fresh-7.3
 scripts/install.sh --yes --write-modprobe linux-fresh-7.3
 scripts/install.sh --yes --write-bls linux-fresh-7.3
 
-# cleanup after installed
-scripts/cleanup.sh --dry-run linux-fresh-7.3
+# cleanup after installed (use --deep to reclaim the disk space after STD is compiled)
 scripts/cleanup.sh --status linux-fresh-7.3
 scripts/cleanup.sh --yes linux-fresh-7.3
+scripts/cleanup.sh --deep --dry-run linux-fresh-7.3
+scripts/cleanup.sh --deep --yes linux-fresh-7.3
 
 # revert / prune
 scripts/uninstall.sh --dry-run linux-fresh-7.3
